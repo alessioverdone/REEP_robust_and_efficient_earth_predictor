@@ -156,6 +156,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+# backup del venv creati da setup_env.sh
+venv.old.*/
 
 # Spyder project settings
 .spyderproject
@@ -216,3 +218,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# Our
+# only the dataset folder at the root: a bare "data/" would also ignore
+# other/data/, where the phase-2 dataloader lives
+/data/
+src/dataset/data/
+# registry: checkpoints and run outputs stay local, only the configurations are versioned
+registry/*
+!registry/configurations/
+CLAUDE.md
+WORK_IN_PROGRESS_README.md
+other/
+.idea/

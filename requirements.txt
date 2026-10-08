@@ -1,0 +1,76 @@
+# =====================================================================
+# Dipendenze del progetto. Installare dalla root, con setup_env.sh oppure:
+#
+#     uv venv venv --python=3.10 && source venv/bin/activate
+#     uv pip install torch==2.8.0 torchvision==0.23.0 \
+#         --index-url https://download.pytorch.org/whl/cu128
+#     uv pip install -r requirements.txt
+#
+# La versione precedente di questo file (ereditata dal repo di Stable
+# Diffusion) e' in requirements-legacy.txt: chiedeva torch 2.1.0+cu118, che
+# NON gira sulle GPU Blackwell (RTX 50xx, sm_120), e una cinquantina di
+# pacchetti che questa pipeline non importa mai.
+#
+# Dopo un'installazione andata a buon fine conviene congelare le versioni:
+#     uv pip freeze > requirements-lock.txt
+# =====================================================================
+
+# ---- PyTorch ----
+# Qui NON c'e' l'indice di PyTorch, e le wheel giuste (quelle CUDA 12.8, le
+# prime con i kernel sm_120 delle Blackwell) le installa setup_env.sh PRIMA di
+# questo file, con --index-url https://download.pytorch.org/whl/cu128 .
+# Motivo: su quell'indice sono specchiati anche altri pacchetti, a versioni
+# ferme al 2023 (torchmetrics 1.0.3, per dirne una), e uv per difendersi dagli
+# attacchi di dependency confusion considera solo il PRIMO indice in cui trova
+# un pacchetto -- quindi basta nominarlo qui per ritrovarsi mezza libreria
+# vecchia di tre anni. I pin restano per documentare la versione attesa: un
+# 2.8.0+cu128 gia' installato li soddisfa e non viene toccato.
+torch==2.8.0
+torchvision==0.23.0
+
+# xformers e' opzionale: sgm/modules/attention.py lo cerca in un try/except e
+# senza usa l'SDPA di torch. Se lo si vuole, va presa la build compilata per
+# lo stesso torch, altrimenti rompe l'installazione.
+# xformers
+
+# ---- Calcolo scientifico ----
+# numpy 2 va bene da torch 2.3 in poi (torch 2.1 era compilato contro numpy 1.x:
+# era uno dei motivi per cui il vecchio ambiente non partiva).
+numpy>=2.0,<3
+scipy                     # sgm/modules/diffusionmodules/sampling_utils.py
+einops
+scikit-learn>=1.4         # src/utils/utils.py (root_mean_squared_error)
+
+# ---- Modelli e training ----
+diffusers>=0.35           # AutoencoderKL del first stage + i blocchi del motion module
+accelerate>=1.0           # richiede torch >= 2.4 (usa torch.xpu)
+# <5: sgm/modules/encoders/modules.py e diffusion_utils usano API della 4.x
+transformers>=4.45,<5     # ContextManagers e gli encoder CLIP/T5 di sgm
+timm>=1.0                 # PatchEmbed / Mlp / use_fused_attn del DiT
+# Il training gira su accelerate, non su Lightning, ma sgm/__init__.py importa
+# AutoencodingEngine e DiffusionEngine, che sono LightningModule: basta un
+# `from sgm.util import ...` per tirarselo dietro.
+pytorch-lightning
+open-clip-torch           # sgm/modules/encoders/modules.py
+kornia                    # idem
+safetensors
+omegaconf>=2.3
+fsspec                    # sgm/util.py
+
+# ---- Metriche di validazione ----
+# src/model/sgm/modules/diffusionmodules/metric.py (EarthnetX_Metric)
+torchmetrics
+xarray
+properscoring
+
+# ---- Immagini, video, log ----
+pillow
+imageio
+matplotlib
+tqdm
+wandb                     # tracker di accelerate (per ora offline e commentato)
+
+# ---- Dataset EarthNet ----
+# Serve solo a src/dataset/ (download ed esplorazione dei minicubi): per il
+# solo training si puo' omettere.
+earthnet
