@@ -34,28 +34,6 @@ Finestre temporali
     train / val / test / iid / ood / extreme   10 frame di contesto + 20 target (T = 30)
     seasonal                                    20 frame di contesto + 40 target (T = 60)
 
-Per i train/val/test di dataset.json le finestre sono quelle del config del run
-(data.params.T e noise_image_num). Per gli split EarthNet sono fissate dallo
-split: il file di contesto e quello di target, separati, vengono fusi in un solo
-.npz per cubo (cache in <preprocessed_dir>/merged_test/<split>/, ricostruita se
-cambia qualcosa) e da li' in poi si passa dallo stesso dataset del training.
-
-Con --type dit e lo split seasonal la sequenza (60 istanti) e' piu' lunga di
-quella con cui il DiT e' stato addestrato (30): i pesi appresi non dipendono
-dalla lunghezza e vengono caricati cosi' come sono; si ricostruiscono solo i
-buffer sinusoidali delle posizioni temporali, che sono deterministici. E' pero'
-un'estrapolazione in lunghezza, e lo script lo dice a video. Con --type ae non
-c'e' nessun problema: l'autoencoder lavora un frame alla volta.
-
-Cosa viene calcolato
---------------------
-dit  il contesto reale e' dato al modello, che predice i frame futuri con la stessa
-     procedura della validazione del training (log_videos_local_and_wandb: VAE,
-     EulerEDMSampler con CFG, decode); si confrontano i frame futuri veri e
-     predetti.
-ae   si codificano (media della posterior, come nel training) e si decodificano i
-     frame di contesto; si confrontano i frame veri e ricostruiti.
-
 Output
 ------
 registry/outputs/<autoencoder|diffusion>/<run>/results/predictions/<ae|dit>/<split>/
@@ -64,10 +42,6 @@ registry/outputs/<autoencoder|diffusion>/<run>/results/predictions/<ae|dit>/<spl
     <cubo>/comparison.pdf               le stesse figure, una pagina per banda
     selected_samples.txt                i cubi scelti (il seed li rende riproducibili)
     run_info.json                       modello, checkpoint, finestre, seed, rmse per cubo
-
-I valori sono de-normalizzati con i lo/hi di stats.json del dataset del run, quindi
-tornano in riflettanza; la scala dei colori e' una per banda, comune a reale e
-predetto (vedi --scale).
 """
 
 from __future__ import annotations
@@ -84,29 +58,25 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 # --- percorsi ---------------------------------------------------------------
-# Il config dei run contiene percorsi relativi alla root del progetto
-# ("data/preprocessed/...", "registry/outputs/..."), e le classi si importano da
-# `src.` e da `sgm.` (src/model nel PYTHONPATH, come nel README): si sistema qui,
-# cosi' lo script gira da qualunque cartella senza export.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 for _path in (PROJECT_ROOT, PROJECT_ROOT / "src" / "model"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-import numpy as np  # noqa: E402
-import torch  # noqa: E402
-from accelerate import PartialState  # noqa: E402
-from accelerate.utils import set_seed  # noqa: E402
-from matplotlib.backends.backend_pdf import PdfPages  # noqa: E402
-from matplotlib.figure import Figure  # noqa: E402
-from safetensors.torch import load_file as load_safetensors  # noqa: E402
-from torch.utils.data import DataLoader  # noqa: E402
+import numpy as np
+import torch
+from accelerate import PartialState
+from accelerate.utils import set_seed
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.figure import Figure
+from safetensors.torch import load_file as load_safetensors
+from torch.utils.data import DataLoader
 
-from src.config import PathsCfg, load_config, project_path, use_project_dir, validate_config  # noqa: E402
-from src.dataset.dataloader_s2_dif import S2DiffusionCubeDataset, load_highres_stats  # noqa: E402
-from src.dataset.dataset_info import load_dataset_info, split_files  # noqa: E402
-from src.model.autoencoder_utils import get_vae  # noqa: E402
-from src.training.run_outputs import write_json  # noqa: E402
+from src.config import PathsCfg, load_config, project_path, use_project_dir, validate_config
+from src.dataset.dataloader_s2_dif import S2DiffusionCubeDataset, load_highres_stats
+from src.dataset.dataset_info import load_dataset_info, split_files
+from src.model.autoencoder_utils import get_vae
+from src.training.run_outputs import write_json
 
 log = logging.getLogger("visualize_predictions")
 
