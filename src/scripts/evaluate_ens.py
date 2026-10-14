@@ -88,7 +88,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 # anche la root del progetto e src/model su sys.path, e serve prima di ogni
 # import `src.` o `sgm.`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import visualize_predictions as viz  # noqa: E402
+import inference_visualization as viz  # noqa: E402
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
