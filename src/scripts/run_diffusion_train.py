@@ -14,6 +14,7 @@ from src.config import config_from_cli
 from src.model.diffusion_utils import (configure_train, describe_run, instantiate_models,
                                        mark_run_ended, prepare_training, setup_dataloader,
                                        train_loop)
+from src.training.ens_eval import evaluate_test_splits, release_gpu_memory
 from src.training.run_outputs import create_shared_run_outputs
 from src.training.runtime import setup_runtime
 from src.training.tracking import start_tracker
@@ -114,6 +115,15 @@ def main(config_file=DEFAULT_CONFIG_FILE,
                        lr_scheduler,
                        error=error)
         raise
+
+    # Test-set evaluation (config section test_eval): evaluate_ens.py on iid / ood /
+    # extreme / seasonal, reloading the checkpoint from disk. The training objects are
+    # dropped first so the GPU holds one copy of the model, not two.
+    if cfg.test_eval.enabled:
+        del (model, conditioner, first_stage_model, optimizer, denoiser, sampler,
+             loss_fn, train_dataloader, val_dataloader)
+        release_gpu_memory(rt.accelerator)
+        evaluate_test_splits(cfg, rt, outputs, state)
     mark_run_ended(cfg,
                    rt,
                    outputs,

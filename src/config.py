@@ -758,6 +758,24 @@ class EnsCfg:
     SCORING_MODES: ClassVar[tuple[str, ...]] = ("fast", "toolkit")
 
 
+# ============================================== TEST EVAL ==============================================
+# Valutazione sui test set EarthNet a fine training di fase 2: finito il training loop si
+# chiama src/scripts/evaluate_ens.py sugli split indicati, sul checkpoint scelto. I file
+# finiscono dove li metterebbe lo script lanciato a mano:
+# <run>/results/statistics/metrics_results_<split>_K_<K>.{json,csv}.
+# Un errore qui (es. cartella di uno split mancante) non fa fallire il run: il training e'
+# gia' finito e i checkpoint salvati, si rilancia evaluate_ens.py a mano.
+
+@dataclass
+class TestEvalCfg:
+    enabled: bool = True                    # false = niente valutazione a fine training
+    splits: list[str] = field(default_factory=lambda: ["iid", "ood", "extreme", "seasonal"])
+    checkpoint: str = "best"                # best | latest | nome di una cartella di checkpoints/
+    num_samples: Optional[int] = None       # K predizioni per cubo; null = run.val_num_samples
+    subset: int = 0                         # 0 = tutti i cubi; N = N cubi a caso (giro di prova)
+    seed: int = 42                          # seed del sampling e del rumore di OLS
+
+
 # ================================================ WANDB ================================================
 # Live report of the training on Weights & Biases (src/training/tracking.py),
 # for both phases. The run folder under registry/outputs/ stays the reference:
@@ -792,6 +810,7 @@ class TrainCfg:
     data: DataCfg = field(default_factory=DataCfg)
     accelerate: AccelerateCfg = field(default_factory=AccelerateCfg)
     ens: EnsCfg = field(default_factory=EnsCfg)
+    test_eval: TestEvalCfg = field(default_factory=TestEvalCfg)
     wandb: WandbCfg = field(default_factory=WandbCfg)
 
 
@@ -1183,6 +1202,17 @@ def validate_config(cfg: TrainCfg) -> None:
         errors.append("ens.train_cubes and ens.train_every_epochs must be >= 1")
     if ens.enabled and cfg.run.val_num_samples < 1:
         errors.append("run.val_num_samples must be >= 1")
+    test_eval = cfg.test_eval
+    if test_eval.enabled:
+        known = ("iid", "ood", "extreme", "seasonal", "train", "val", "test")
+        bad = [s for s in test_eval.splits if s.lower().removesuffix("_test_split") not in known]
+        if not test_eval.splits or bad:
+            errors.append(f"test_eval.splits={list(test_eval.splits)} must be a non-empty list "
+                          f"of {known} (unknown: {bad})")
+        if test_eval.num_samples is not None and test_eval.num_samples < 1:
+            errors.append("test_eval.num_samples must be >= 1 (or null)")
+        if test_eval.subset < 0:
+            errors.append("test_eval.subset must be >= 0")
     if cfg.autoencoder.early_stopping_patience < 0 or cfg.autoencoder.early_stopping_min_delta < 0:
         errors.append("autoencoder.early_stopping_patience and "
                       "autoencoder.early_stopping_min_delta must be >= 0")

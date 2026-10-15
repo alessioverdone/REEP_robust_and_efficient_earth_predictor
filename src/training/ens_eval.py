@@ -20,6 +20,9 @@ con l'ENS piu' alto (best-of-K, come evaluate_ens.py --num-samples K).
 """
 
 import copy
+import gc
+import logging
+import os
 import random
 import time
 from pathlib import Path
@@ -33,6 +36,73 @@ from src.utils.ens_metrics import (MaskedCubeDataset, aggregate, score_batch, un
 
 # the statistics written in history.csv, as val_<name> and train_<name>
 ENS_KEYS = ("ENS", "MAD", "OLS", "EMD", "SSIM", "SSIM_RAW", "P_MAE", "N_MAE")
+
+
+logger = logging.getLogger(__name__)
+
+
+def evaluate_test_splits(cfg, rt, outputs, state):
+    """
+    End of the diffusion training: src/scripts/evaluate_ens.py on the splits of
+    config section `test_eval`, on the checkpoint it names. The results go where the
+    script puts them when launched by hand, <run>/results/statistics/.
+
+    Call it after train_loop and after the training objects are released
+    (release_gpu_memory): the DiT is loaded again from the checkpoint on disk, as the
+    script does, so the evaluation is the one a later manual run would give.
+    Only the main process evaluates (the script is single-process); the other ranks
+    return at once. A failure is logged and swallowed: the training is over and its
+    checkpoints are saved, evaluate_ens.py can be rerun by hand.
+    Returns the payloads of the evaluated splits (None when skipped).
+    """
+    test_eval = cfg.test_eval
+    if not test_eval.enabled or cfg.run.validate_only or state.global_step <= 0:
+        return None
+    if not rt.accelerator.is_main_process:
+        return None
+
+    checkpoint = test_eval.checkpoint
+    if checkpoint == "best" and not os.path.isfile(
+            os.path.join(outputs.checkpoints, "best", "model.safetensors")):
+        logger.warning("[test_eval] checkpoints/best not found (no validation improved the "
+                       "minimum?): using the latest checkpoint")
+        checkpoint = "latest"
+    k = int(test_eval.num_samples or cfg.run.val_num_samples)
+    argv = ["--model", outputs.root,
+            "--split", *test_eval.splits,
+            "--checkpoint", checkpoint,
+            "--num-samples", str(k),
+            "--seed", str(test_eval.seed),
+            "--device", str(rt.accelerator.device)]
+    if test_eval.subset:
+        argv += ["--subset", str(test_eval.subset)]
+
+    logger.info(f"[test_eval] evaluate_ens.py {' '.join(argv)}")
+    start = time.time()
+    try:
+        # lazy: the script pulls in the whole inference stack (and edits sys.path)
+        from src.scripts import evaluate_ens
+        payloads = evaluate_ens.evaluate_run(evaluate_ens.parse_args(argv))
+    except (Exception, SystemExit) as error:     # noqa: BLE001 - never lose a finished run
+        logger.exception(f"[test_eval] failed, run kept as completed: {error}")
+        return None
+
+    for payload in payloads:
+        split = payload["run"]["split"]
+        rt.tracker.summary({f"test/{split}/{key}": value
+                            for key, value in payload["aggregate"].items()
+                            if isinstance(value, (int, float))})
+    logger.info(f"[test_eval] {len(payloads)} splits evaluated in {time.time() - start:.0f}s, "
+                f"results in {os.path.join(outputs.results, 'statistics')}")
+    return payloads
+
+
+def release_gpu_memory(accelerator):
+    """Drops what the accelerator still references (the caller deletes its own names) and frees the cache."""
+    accelerator.free_memory()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def wrap_with_cloud_mask(dataset, ens_cfg):

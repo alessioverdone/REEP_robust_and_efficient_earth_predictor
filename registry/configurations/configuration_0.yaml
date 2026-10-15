@@ -240,6 +240,20 @@ ens:
   cloud_prob_threshold: 0.20
   cloud_prob_scale: 100.0
 
+# Evaluation on the EarthNet test splits at the end of the diffusion training (phase 2):
+# when the training loop is over, src/scripts/evaluate_ens.py is run on these splits.
+# Output, same as running the script by hand:
+# <run>/results/statistics/metrics_results_<split>_K_<K>.{json,csv}
+# A failure here (e.g. a missing test folder) does not fail the run: the training is
+# already done, rerun evaluate_ens.py by hand. enabled: false skips it altogether.
+test_eval:
+  enabled: true
+  splits: [iid, ood, extreme, seasonal]
+  checkpoint: best            # best | latest | name of a folder in checkpoints/
+  num_samples: null           # K predictions per cube (best kept); null = run.val_num_samples
+  subset: 0                   # 0 = every cube | N = N random cubes (quick test)
+  seed: 42
+
 # Live report on Weights & Biases (both phases): metrics, artifacts/ and
 # results/ files, example images. Never the checkpoints. Online needs `wandb login`.
 wandb:

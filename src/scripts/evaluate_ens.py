@@ -477,7 +477,8 @@ def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
 # ===========================================================================
 # 7. CLI
 # ===========================================================================
-def parse_args():
+def parse_args(argv: Optional[Sequence[str]] = None):
+    """argv=None legge sys.argv; il training passa la lista, cosi' i default sono questi."""
     p = argparse.ArgumentParser(
         description="ENS (MAD, OLS, EMD, SSIM), SSIM grezza, P-MAE e N-MAE di un DiT "
                     "gia' addestrato, su uno o piu' split.",
@@ -537,21 +538,19 @@ def parse_args():
                    help="dove si salvano i cubi test fusi context+target "
                         "(default: <preprocessed_dir>/merged_test)")
     p.add_argument("--log-level", default="INFO")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
-    logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-                        datefmt="%m/%d/%Y %H:%M:%S",
-                        level=getattr(logging, args.log_level.upper(), logging.INFO))
+def evaluate_run(args) -> List[Dict[str, object]]:
+    """
+    Valuta il run args.model sugli split args.split e scrive i risultati in
+    <run>/results/statistics/. E' il corpo di main(), richiamabile anche dal training
+    (src/training/ens_eval.py) a fine loop. Ritorna i payload degli split valutati;
+    se qualcuno fallisce li valuta comunque tutti e poi solleva SystemExit.
+    """
     use_project_dir()
     family_dir = project_path(args.outputs_dir) / viz.FAMILY_DIRS["dit"]
 
-    if args.list_runs:
-        for run in viz.list_runs(family_dir):
-            print(run.relative_to(project_path(args.outputs_dir)).as_posix())
-        return
     if not args.model:
         raise SystemExit("--model e' obbligatorio (oppure usa --list-runs)")
     if not args.split:
@@ -608,6 +607,21 @@ def main() -> None:
         for name, reason in failed:
             print(f"  {name}: {reason.splitlines()[0]}")
         raise SystemExit(1)
+    return payloads
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+                        datefmt="%m/%d/%Y %H:%M:%S",
+                        level=getattr(logging, args.log_level.upper(), logging.INFO))
+    if args.list_runs:
+        use_project_dir()
+        family_dir = project_path(args.outputs_dir) / viz.FAMILY_DIRS["dit"]
+        for run in viz.list_runs(family_dir):
+            print(run.relative_to(project_path(args.outputs_dir)).as_posix())
+        return
+    evaluate_run(args)
 
 
 if __name__ == "__main__":
