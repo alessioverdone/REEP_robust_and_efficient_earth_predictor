@@ -80,7 +80,8 @@ diffusion:
   channel_shift_factors: null # shift_scale_per_channel only; null = read from the VAE checkpoint
   channel_scale_factors: null
   disable_first_stage_autocast: true
-  save_best_by: rmse          # epoch kept as checkpoints/best: rmse (lowest val latter_rmse) | loss (lowest val loss) | ens (highest val ENS, needs ens.enabled)
+  loss_pixels: all            # pixels of the diffusion loss: all (every pixel) | valid (only the cloud-free ones of the target frames, same rule as the ENS: ens.cloud_prob_threshold / cloud_prob_scale)
+  save_best_by: rmse         # epoch kept as checkpoints/best: rmse (lowest val latter_rmse) | loss (lowest val loss) | ens (highest val ENS, needs ens.enabled)
   input_key: imgs
   img_log_step_inteval: 1000000
   log_keys: [txt]

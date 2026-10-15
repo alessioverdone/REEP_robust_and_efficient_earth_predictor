@@ -568,6 +568,15 @@ class DiffusionCfg:
     channel_scale_factors: Optional[list[float]] = None
 
     disable_first_stage_autocast: bool = True
+    # Which pixels the diffusion loss (training, and the validation loss) is computed on:
+    #   "all":   every pixel, whatever the cloudiness
+    #   "valid": only the cloud-free pixels of the target frames, with the ENS rule
+    #            (ens.cloud_prob_threshold / ens.cloud_prob_scale, read from the original
+    #            .npz; ens.enabled is not needed). The loss lives in the latent space, so
+    #            the pixel mask is area-averaged to the latent resolution: every latent
+    #            cell weighs the fraction of its pixels that are valid.
+    loss_pixels: str = "all"
+    LOSS_PIXELS: ClassVar[tuple[str, ...]] = ("all", "valid")
     # Which validation epoch is saved as checkpoints/best:
     #   "rmse": lowest latter_rmse (RMSE on the last 10 of the 20 predicted frames)
     #   "loss": lowest diffusion loss on the validation set (one extra forward pass per
@@ -1197,6 +1206,10 @@ def validate_config(cfg: TrainCfg) -> None:
             if cfg.diffusion[key] is not None:
                 errors.append(f"diffusion.{key} is only used with latent_normalization="
                               f"'shift_scale_per_channel': leave it null")
+
+    if cfg.diffusion.loss_pixels not in DiffusionCfg.LOSS_PIXELS:
+        errors.append(f"diffusion.loss_pixels={cfg.diffusion.loss_pixels!r} must be one of "
+                      f"{DiffusionCfg.LOSS_PIXELS}")
 
     ens = cfg.ens
     if ens.scoring not in EnsCfg.SCORING_MODES:

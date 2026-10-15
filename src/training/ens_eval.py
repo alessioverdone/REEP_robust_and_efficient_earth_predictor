@@ -128,7 +128,9 @@ class EnsEvaluator:
         self.batch_size = int(cfg.data.params.batch_size)
         self.num_workers = int(cfg.data.params.num_workers)
         # a prepared DataLoader still exposes its dataset
-        self.train_dataset = train_dataloader.dataset
+        # (with diffusion.loss_pixels=valid it is wrapped in MaskedCubeDataset: use the inner one)
+        dataset = train_dataloader.dataset
+        self.train_dataset = getattr(dataset, "inner", dataset)
         self.lo = np.asarray(self.train_dataset.highres_lo).reshape(-1).astype(np.float32)
         self.hi = np.asarray(self.train_dataset.highres_hi).reshape(-1).astype(np.float32)
         self.scoring_seconds = 0.0          # CPU time of the scoring, since the last reset

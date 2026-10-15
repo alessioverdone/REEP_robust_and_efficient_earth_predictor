@@ -1151,11 +1151,16 @@ def setup_dataloader(cfg,
     datamodule = instantiate_from_config(config_data)
     with accelerator.main_process_first():
         datamodule.setup("fit")
+    loss_on_valid = config_diffusion.loss_pixels == "valid"
+    # loss_pixels=valid: the training cubes carry the cloud mask of their target frames
+    # (read from the original .npz, same rule as the ENS), to leave the cloudy pixels
+    # out of the loss. The model never sees it: train_loop takes it out of the batch.
+    if loss_on_valid:
+        datamodule.train_dataset = wrap_with_cloud_mask(datamodule.train_dataset, cfg.ens)
     train_dataloader = datamodule.train_dataloader()
-    # ens.validation: the validation cubes also carry the cloud mask of their target
-    # frames (read from the original .npz), to leave the cloudy pixels out of the ENS.
-    # The model never sees it: train_loop takes it out of the batch.
-    if (cfg.ens.enabled and cfg.ens.validation and cfg.ens.cloud_mask
+    # ens.validation (or loss_pixels=valid, for the validation loss): the validation
+    # cubes carry the cloud mask too, to leave the cloudy pixels out of the ENS.
+    if (((cfg.ens.enabled and cfg.ens.validation and cfg.ens.cloud_mask) or loss_on_valid)
             and datamodule.val_dataset is not None):
         datamodule.val_dataset = wrap_with_cloud_mask(datamodule.val_dataset, cfg.ens)
     val_dataloader = datamodule.val_dataloader()
@@ -1878,6 +1883,10 @@ def train_loop(cfg,
     # ens_columns = the columns it adds to history.csv, empty (they stay empty on the
     # epochs where nothing is scored, so the header never changes).
     ens_cfg = cfg.ens
+    loss_on_valid = config_diffusion.loss_pixels == "valid"   # diffusion loss on the cloud-free pixels only
+    if loss_on_valid:
+        logger.info(f"[loss] only the valid pixels of the target frames (cloud probability < "
+                    f"{ens_cfg.cloud_prob_threshold}, scale {ens_cfg.cloud_prob_scale})")
     ens_eval = EnsEvaluator(cfg, accelerator, train_dataloader) if ens_cfg.enabled else None
     ens_columns = ens_eval.columns() if ens_eval is not None else {}
     if ens_eval is not None:
@@ -1967,6 +1976,8 @@ def train_loop(cfg,
 
         # Start Train!
         for step, batch in enumerate(epoch_dataloader):
+            batch.pop("hflip", None)                 # only for the cloud mask (MaskedCubeDataset)
+            loss_mask = batch.pop("cloud_mask", None) if loss_on_valid else None
             for batch_key in batch.keys():
                 if torch.is_tensor(batch[batch_key]):
                     batch[batch_key] = batch[batch_key].to(dtype=weight_dtype)
@@ -2001,7 +2012,8 @@ def train_loop(cfg,
                             # expects a one-argument decode(latent) function
                             functools.partial(decode_first_stage,
                                               first_stage_model=first_stage_model,
-                                              config_diffusion=config_diffusion))  # b
+                                              config_diffusion=config_diffusion),
+                            valid_mask=loss_mask)  # b
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(config_data.params.batch_size)).mean()
@@ -2173,7 +2185,8 @@ def train_loop(cfg,
                                            x_past_mean,
                                            functools.partial(decode_first_stage,
                                                              first_stage_model=first_stage_model,
-                                                             config_diffusion=config_diffusion))[0]
+                                                             config_diffusion=config_diffusion),
+                                           valid_mask=cloud if loss_on_valid else None)[0]
                     model.train()
                     conditioner.train()
                     val_loss_totals[0] += float(val_loss.float().mean()) * vB

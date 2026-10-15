@@ -772,9 +772,11 @@ class S2DiffusionCubeDataset(Dataset):
 
         # Il flip orizzontale tocca solo le variabili con estensione spaziale:
         # meso e' gia' ridotta a una serie temporale, quindi resta invariata.
+        flipped = False
         if self.do_hflip and torch.rand(1).item() < 0.5:
             imgs_t = torch.flip(imgs_t, dims=[-1])
             static_t = torch.flip(static_t, dims=[-1])
+            flipped = True
 
         H, W = imgs_t.shape[-2], imgs_t.shape[-1]
         out: Dict[str, Any] = {
@@ -785,6 +787,10 @@ class S2DiffusionCubeDataset(Dataset):
             "crop_coords_top_left": torch.tensor([0, 0], dtype=torch.long),
             "target_size_as_tuple": torch.tensor([H, W], dtype=torch.long),
         }
+        if self.do_hflip:
+            # MaskedCubeDataset flips the cloud mask the same way (and removes the
+            # key); without it, the training loop does
+            out["hflip"] = flipped
         if self.return_paths:
             out["cube_path"] = str(path)
         return out

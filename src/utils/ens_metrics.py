@@ -113,6 +113,8 @@ class MaskedCubeDataset(Dataset):
         if self.resize is not None and tuple(mask.shape[-2:]) != (self.resize, self.resize):
             mask = (F.interpolate(mask, size=(self.resize, self.resize), mode="area")
                     >= 0.999).float()
+        if item.pop("hflip", False):                # the images were flipped: so is the mask
+            mask = torch.flip(mask, dims=[-1])
         item["cloud_mask"] = mask
         return item
 
