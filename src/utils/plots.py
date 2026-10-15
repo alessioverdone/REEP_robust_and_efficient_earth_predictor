@@ -29,12 +29,10 @@ def read_history(history_csv: str) -> dict:
 def plot_history(history_csv: str,
                  out_dir: str,
                  metrics: tuple,
-                 best_epoch: int = None,
-                 test_metrics: dict = None):
+                 best_epoch: int = None):
     """
     One figure per metric (<metric>.png): train and val per epoch, the best
-    epoch as a dotted vertical line and the test value of the best checkpoint
-    as a dashed horizontal line. Plus lr.png with the learning rate.
+    epoch as a dotted vertical line. Plus lr.png with the learning rate.
     """
     if not os.path.isfile(history_csv):
         return
@@ -59,11 +57,6 @@ def plot_history(history_csv: str,
                        color="gray",
                        linestyle=":",
                        label=f"best (epoch {best_epoch})")
-        if test_metrics and metric in test_metrics:
-            ax.axhline(test_metrics[metric],
-                       color="black",
-                       linestyle="--",
-                       label=f"test, best weights ({test_metrics[metric]:.4g})")
         ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         ax.set_xlabel("epoch")
         ax.set_ylabel(metric)

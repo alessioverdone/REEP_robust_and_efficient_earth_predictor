@@ -21,14 +21,13 @@ paths:
   checkpoints_dir: registry/checkpoints   # checkpoints promoted by hand
   outputs_dir: registry/outputs           # one timestamped folder per run
 
-# The only place where cubes are selected and split (train / val / test by
+# The only place where cubes are selected and split (train / val by
 # location): both phases read the result from <preprocessed_dir>/dataset.json.
 preprocessing:
   # name: n${.limit}_s${.seed}     (default, the folder under data/preprocessed/)
   limit: 1000                 # 0 = all the cubes
   limit_after_drop: false     # true = `limit` counts the cubes left after dropping the bad ones
   val_frac: 0.1
-  test_frac: 0.1
   seed: 0
   times: [10]                 # .npy files for the autoencoder; must contain autoencoder.T
   dtype: float16
@@ -41,7 +40,7 @@ preprocessing:
 
 autoencoder:
   # preprocessed_dir, outputs_dir, image_size (= data.params.resize) and the
-  # train/val/test .npy files are derived: the splits come from the preprocessing
+  # train/val .npy files are derived: the splits come from the preprocessing
   T: 10
   batch_size: 32
   num_workers: 4

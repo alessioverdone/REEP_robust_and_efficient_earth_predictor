@@ -1574,7 +1574,6 @@ def describe_run(cfg,
             # the phase-1 run the weights come from, when they are a run's best.pt
             "autoencoder_run": vae_info.get("run", {}).get("run_id"),
             "autoencoder_val_best": vae_info.get("metrics", {}).get("val_best"),
-            "autoencoder_test": vae_info.get("metrics", {}).get("test"),
             "trained_on_dataset": first_stage_info.get("dataset"),
             "latent_normalization": {
                 "mode": cfg.diffusion.latent_normalization,

@@ -4,7 +4,7 @@ dataset.json: the description of one preprocessed dataset.
 src/dataset/preprocessing.py is the only place where cubes are selected and
 split. It writes the outcome into <preprocessed_dir>/dataset.json: the
 parameters it ran with, how the cubes were selected (limit), and the explicit
-list of cubes of each split (train / val / test). Both training phases read
+list of cubes of each split (train / val). Both training phases read
 their cubes from there and never split again, so the autoencoder and the
 diffusion model see the same cubes and the same locations in each split.
 
@@ -29,7 +29,7 @@ def compute_dataset_id(splits,
     every temporal version): the two things that define what a model sees.
     """
     payload = {
-        "splits": {name: sorted(splits.get(name, [])) for name in ("train", "val", "test")},
+        "splits": {name: sorted(splits.get(name, [])) for name in ("train", "val")},
         "normalization": {t: {"lo": s["lo"], "hi": s["hi"]} for t, s in sorted(stats.items())},
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8"))

@@ -156,9 +156,8 @@ class PreprocessingCfg:
     limit_after_drop: bool = False
 
     # Split by location (cubes of the same tile overlap spatially): fractions
-    # of the locations held out for validation and test.
+    # of the locations held out for validation.
     val_frac: float = 0.1
-    test_frac: float = 0.1
     seed: int = 0
 
     # Temporal versions of the .npy files for the autoencoder (first T frames
@@ -192,12 +191,11 @@ class AutoencoderCfg:
     # Conviene partire da T=10 e passare a T=30 solo se si vede overfitting.
     T: int = 10
 
-    # The three splits decided by the preprocessing (dataset.json), one file
+    # The two splits decided by the preprocessing (dataset.json), one file
     # each: the same cubes and locations the diffusion model uses for its
-    # train / val / test. Nothing is split here.
+    # train / val. Nothing is split here.
     train_npy: str = "${.preprocessed_dir}/train_T${.T}.npy"
     val_npy: str = "${.preprocessed_dir}/val_T${.T}.npy"
-    test_npy: Optional[str] = "${.preprocessed_dir}/test_T${.T}.npy"    # null = no test evaluation
     # cubes and locations of each file, for training_info.json
     manifest: str = "${.preprocessed_dir}/manifest.json"
     dataset_json: str = "${.preprocessed_dir}/dataset.json"
@@ -1152,9 +1150,9 @@ def validate_config(cfg: TrainCfg) -> None:
     pre = cfg.preprocessing
     if pre.limit < 0:
         errors.append(f"preprocessing.limit={pre.limit} must be >= 0 (0 = all the cubes)")
-    if pre.val_frac < 0 or pre.test_frac < 0 or pre.val_frac + pre.test_frac >= 1:
-        errors.append(f"preprocessing.val_frac={pre.val_frac} and test_frac={pre.test_frac} "
-                      f"must be >= 0 and leave locations for train (sum < 1)")
+    if pre.val_frac < 0 or pre.val_frac >= 1:
+        errors.append(f"preprocessing.val_frac={pre.val_frac} must be >= 0 and < 1 "
+                      f"(locations are left for train)")
     if pre.val_frac <= 0:
         errors.append("preprocessing.val_frac must be > 0: both phases validate on that split")
     if pre.dtype not in ("float16", "float32"):
@@ -1214,7 +1212,7 @@ def validate_config(cfg: TrainCfg) -> None:
         errors.append("run.val_num_samples must be >= 1")
     test_eval = cfg.test_eval
     if test_eval.enabled:
-        known = ("iid", "ood", "extreme", "seasonal", "train", "val", "test")
+        known = ("iid", "ood", "extreme", "seasonal", "train", "val")
         bad = [s for s in test_eval.splits if s.lower().removesuffix("_test_split") not in known]
         if not test_eval.splits or bad:
             errors.append(f"test_eval.splits={list(test_eval.splits)} must be a non-empty list "

@@ -184,17 +184,15 @@ class AutoencoderState:
     train_metrics: dict = field(default_factory=dict)       # last epoch
     val_metrics: dict = field(default_factory=dict)         # last epoch
     best_val_metrics: dict = field(default_factory=dict)
-    test_metrics: dict = field(default_factory=dict)        # best.pt on the test set
     epoch_seconds: list = field(default_factory=list)       # training only, per epoch
     images_per_second: list = field(default_factory=list)   # training throughput, per epoch
-    test_seconds: float = 0.0
     lr_reductions: list = field(default_factory=list)       # [{"epoch", "lr"}]
     # early stopping: reference value (oriented to the minimum) and epochs since
     # it last improved by more than min_delta
     early_stop_reference: float = float("inf")
     epochs_without_improvement: int = 0
     stopped_early: bool = False
-    # best weights on CPU: the test uses them also when no checkpoint is saved
+    # best weights on CPU: the scale factor uses them also when no checkpoint is saved
     best_state_dict: Optional[dict] = None
     checkpoints: dict = field(default_factory=dict)         # file name -> info
     # diffusion.scale_factor / shift_factor measured on the best weights at the

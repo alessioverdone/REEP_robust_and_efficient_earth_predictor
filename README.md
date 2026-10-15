@@ -47,7 +47,7 @@ are the `preprocessing` section of the config (no command-line defaults):
 |---|---|
 | `limit` | number of cubes, `0` = all of them; evenly spaced over the sorted file list |
 | `limit_after_drop` | `false`: `limit` cubes are sampled, then the bad ones are dropped (the dataset ends up smaller); `true`: `limit` counts the cubes left **after** the drop |
-| `val_frac`, `test_frac`, `seed` | split **by location** into train / val / test |
+| `val_frac`, `seed` | split **by location** into train / val |
 | `times` | temporal versions of the `.npy` files for the autoencoder (must contain `autoencoder.T`) |
 | `name` | folder under `data/preprocessed/`, default `n${limit}_s${seed}` |
 
@@ -58,7 +58,7 @@ Reads `data/raw/train/`, writes into `data/preprocessed/<name>/`:
 | `dataset.json` | **both phases**: explicit list of the cubes of each split, parameters, dataset id. Written last |
 | `stats.json` | phase 2: per-band scales, `keep_map`, dropped cubes, diagnostics |
 | `cond_stats.json` | phase 2: min/max of mesodynamic and highresstatic on train |
-| `{train,val,test}_T10.npy`, `manifest.json` | phase 1: flattened images normalized to `[-1, 1]` |
+| `{train,val}_T10.npy`, `manifest.json` | phase 1: flattened images normalized to `[-1, 1]` |
 
 A cube is dropped when it has an entirely missing image in the frames the
 diffusion model reads (`preprocessing.check_frames` = `data.params.T`). A
@@ -77,7 +77,7 @@ diffusion model works on (128×128 → 32×32 by default). The training resoluti
 is `data.params.resize`: for faster experiments, `--set data.params.resize=64`
 (the `.npy` files stay at 128, batches are downsampled on the GPU).
 
-Train, validation and test are the three `.npy` files of the preprocessed
+Train and validation are the two `.npy` files of the preprocessed
 dataset (`paths.preprocessed_dir`): nothing is split here. At the end of the
 training it measures `diffusion.scale_factor` (1 / std of the latents) and
 `diffusion.shift_factor` (their mean) with the best weights, plus the per-channel
@@ -90,17 +90,15 @@ registry/outputs/autoencoder/<YYYY-MM-DD_HH-MM-SS>/
   artifacts/
     config.json          resolved config
     config.yaml          same config, reloadable with --cfgdir
-    training_info.json   run, dataset, model, compute cost, train/val/test metrics, checkpoints
+    training_info.json   run, dataset, model, compute cost, train/val metrics, checkpoints
     history.csv          one row per epoch
     train.log
   checkpoints/           best.pt and last.pt (none with autoencoder.save_checkpoints=false)
   results/
-    curves/              loss, mse, psnr, ssim (train/val, test as a dashed line), lr
-    reconstructions/     val_epoch_XXX.png during training, test_best.png at the end
+    curves/              loss, mse, psnr, ssim (train/val), lr
+    reconstructions/     val_epoch_XXX.png during training
 ```
 
-The test set is `autoencoder.test_npy` (the test split of the preprocessing),
-evaluated with the best weights at the end of the training.
 Training stops early after `autoencoder.early_stopping_patience` epochs without
 improving `val_<save_best_by>` by more than `early_stopping_min_delta` (0 = off).
 
@@ -299,7 +297,7 @@ I tre oggetti che attraversano il codice:
 
 `wandb.enabled: true` (or `--set wandb.enabled=true`) reports both phases live
 on W&B: the per-epoch metrics of `history.csv` (`epoch/...`), the per-step
-training loss of phase 2 (`step/...`), the best/test values in the run summary,
+training loss of phase 2 (`step/...`), the best values in the run summary,
 the files of `artifacts/` and `results/` (followed while they change), and the
 example PNGs as images. Checkpoints are never uploaded. The W&B run is named
 `<phase>/<project_name>/<timestamp>`, grouped by `project_name`, with the

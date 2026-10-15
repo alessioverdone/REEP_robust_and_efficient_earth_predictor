@@ -23,7 +23,6 @@ Argomenti principali
           percorso della cartella del run.
 --split   uno o piu' fra
               train, val       split di dataset.json (preprocessing), cubi da data/raw/train
-              test             split di test di dataset.json (stesse location del train)
               iid, ood,
               extreme          split di test EarthNet: data/raw/<split>_test_split/{context,target}
               seasonal         come sopra, ma con finestre piu' lunghe
@@ -31,7 +30,7 @@ Argomenti principali
 
 Finestre temporali
 ------------------
-    train / val / test / iid / ood / extreme   10 frame di contesto + 20 target (T = 30)
+    train / val / iid / ood / extreme   10 frame di contesto + 20 target (T = 30)
     seasonal                                    20 frame di contesto + 40 target (T = 60)
 
 Output
@@ -103,7 +102,6 @@ class SplitSpec:
 SPLITS: Dict[str, SplitSpec] = {
     "train": SplitSpec("train", earthnet=False),
     "val": SplitSpec("val", earthnet=False),
-    "test": SplitSpec("test", earthnet=False),
     "iid": SplitSpec("iid", earthnet=True, n_context=10, n_target=20),
     "ood": SplitSpec("ood", earthnet=True, n_context=10, n_target=20),
     "extreme": SplitSpec("extreme", earthnet=True, n_context=10, n_target=20),

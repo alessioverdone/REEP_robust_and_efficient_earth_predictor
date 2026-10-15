@@ -21,7 +21,7 @@ Argomenti principali
           'latest' o il percorso della cartella). Stessa risoluzione di
           visualize_predictions.py.
 --split   uno o piu' fra
-              train, val, test     split di dataset.json (cubi da data/raw/train)
+              train, val           split di dataset.json (cubi da data/raw/train)
               iid, ood, extreme    split di test EarthNet: data/raw/<split>_test_split/
                                    {context,target}
               seasonal             come sopra, ma con finestre piu' lunghe
@@ -29,7 +29,7 @@ Argomenti principali
 
 Finestre temporali
 ------------------
-    train / val / test / iid / ood / extreme   10 frame di contesto + 20 target (T = 30)
+    train / val / iid / ood / extreme   10 frame di contesto + 20 target (T = 30)
     seasonal                                    20 frame di contesto + 40 target (T = 60)
 
 Cosa calcola
