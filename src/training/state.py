@@ -144,6 +144,9 @@ class TrainState:
     # pixel RMSE per lead time (model and context-mean baseline), last and best validation
     val_lead_time: dict = field(default_factory=dict)
     best_val_lead_time: dict = field(default_factory=dict)
+    # ENS statistics of the last validation / training sample (config section `ens`)
+    ens_val: dict = field(default_factory=dict)
+    ens_train: dict = field(default_factory=dict)
     epoch_seconds: list = field(default_factory=list)       # training only, per epoch
     cubes_per_second: list = field(default_factory=list)    # training throughput, per epoch
     checkpoints: dict = field(default_factory=dict)         # folder name -> info

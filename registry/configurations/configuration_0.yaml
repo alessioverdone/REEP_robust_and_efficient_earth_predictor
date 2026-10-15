@@ -219,6 +219,27 @@ accelerate:
   validate_epoch_interval: 10
   validate_batch_num: 10000
 
+# EarthNet metrics during the diffusion training (phase 2): ENS = harmonic mean of
+# MAD, OLS, EMD, SSIM, plus SSIM_RAW, P-MAE and N-MAE, the same as
+# src/scripts/evaluate_ens.py (shared code: src/utils/ens_metrics.py). They need real
+# forecasts (full sampling), so they are computed only where inference is done anyway:
+# on the validation set in the validation epochs (accelerate.validate_epoch_interval),
+# and optionally on a sample of training cubes. Every cube is predicted
+# run.val_num_samples (K) times and the best prediction (highest ENS) is kept.
+# Columns of history.csv: val_ENS, val_MAD, ... and train_ENS, ...; plots in results/curves/.
+ens:
+  enabled: false
+  validation: true            # on the validation set, in the validation epochs
+  train: false                # also on a sample of training cubes
+  train_cubes: 100            # how many training cubes per evaluation
+  train_every_epochs: 1       # 1 = at the end of every epoch
+  train_fixed_subset: true    # same cubes every time (comparable curves) | new random sample each time
+  scoring: fast               # fast | toolkit
+  ssim_data_range: 2.0
+  cloud_mask: true            # exclude cloudy pixels, read from the original .npz
+  cloud_prob_threshold: 0.20
+  cloud_prob_scale: 100.0
+
 # Live report on Weights & Biases (both phases): metrics, artifacts/ and
 # results/ files, example images. Never the checkpoints. Online needs `wandb login`.
 wandb:

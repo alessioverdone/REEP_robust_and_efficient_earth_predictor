@@ -92,54 +92,24 @@ import inference_visualization as viz  # noqa: E402
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
-import torch.nn.functional as F  # noqa: E402
 from accelerate.utils import set_seed  # noqa: E402
-from earthnet.parallel_score import CubeCalculator  # noqa: E402
-from skimage.metrics import structural_similarity  # noqa: E402
 from torch.utils.data import DataLoader, Dataset  # noqa: E402
 
 from src.config import PathsCfg, project_path, use_project_dir  # noqa: E402
 from src.dataset.dataset_info import load_dataset_info  # noqa: E402
+# lo scoring ENS sta in src/utils/ens_metrics.py, condiviso con il training loop
+# e con evaluate_ae_ens.py
+from src.utils.ens_metrics import (  # noqa: E402
+    CLOUD_PROB_SCALE, CLOUD_PROB_THRESHOLD, SCORING_MODES, SSIM_DATA_RANGE, SSIM_SCALING,
+    STATISTICS_DIRNAME, MaskedCubeDataset, MaskSources, aggregate, score_batch,
+)
 
 log = logging.getLogger("evaluate_ens")
-
-# Sottocartella dei risultati del run in cui si scrivono i file.
-STATISTICS_DIRNAME = "statistics"
-
-# --- costanti dello scoring EarthNet, da earthnet-toolkit 0.3.11 ------------
-SSIM_SCALING = 10.31885115          # porta un SSIM di 0.8 a un ssim-score di 0.1
-SSIM_MIN_VALID_FRACTION = 0.7       # un frame entra se e' valido per almeno il 70%
-SSIM_DATA_RANGE = 2.0               # il default di scikit-image per i float ai tempi
-
-# Esponenti di CubeCalculator.MAD e CubeCalculator.EMD, copiati dal toolkit: cambiarli
-# sposterebbe la scala rispetto ai punteggi pubblicati.
-MAD_SCALING = 0.06649346971087526
-EMD_SCALING = 0.10082047548620601
-
-# Maschera nuvole: probabilita' di nuvola (canale 4 dei cubi a 7 canali) sotto cui un
-# pixel e' valido, e fondo scala del canale (EarthNet la da' in percentuale, 0-100).
-CLOUD_PROB_THRESHOLD = 0.20
-CLOUD_PROB_SCALE = 100.0
-CLOUD_PROB_CHANNEL = 4
-N_CHANNELS_WITH_CLOUD_PROB = 7
-
-# Implementazioni di MAD ed EMD: 'fast' sono le riscritture vettorizzate di questo
-# file, 'toolkit' le funzioni originali di earthnet. Stesso numero.
-SCORING_MODES = ("fast", "toolkit")
-
-# Indici delle bande dentro highresdynamic, nell'ordine del dataloader
-# (blue, green, red, nir).
-BAND_RED = 2
-BAND_NIR = 3
 
 
 # ===========================================================================
 # 1. Cubi dello split, finestre e maschera nuvole
 # ===========================================================================
-# cubo letto dal dataset (percorso .npz) -> (file da cui leggere la maschera, primo
-# istante dei frame target dentro quel file)
-MaskSources = Dict[str, Tuple[Path, int]]
-
 
 def select_cubes(pool: Sequence[Path], args) -> List[Path]:
     """
@@ -200,56 +170,6 @@ def build_split(spec: viz.SplitSpec, cfg, args, n_context: int,
     desc = f"test {spec.name} ({test_dir.as_posix()}, {len(pairs)} coppie context/target)"
     return selected, sources, desc
 
-
-def valid_mask(hd: np.ndarray, threshold: float, prob_scale: float) -> np.ndarray:
-    """
-    highresdynamic (H, W, C, T) di un file originale -> (T, H, W) bool, True = pixel
-    da usare. Dispatch sul numero di canali, come i due formati di EarthNet:
-    7 canali = cloud probability al canale 4, 5 canali = maschera binaria in fondo.
-    I valori non finiti contano come pixel da scartare.
-    """
-    if hd.shape[2] >= N_CHANNELS_WITH_CLOUD_PROB:
-        valid = (hd[:, :, CLOUD_PROB_CHANNEL, :] / prob_scale) < threshold
-    else:
-        valid = hd[:, :, -1, :] == 0
-    return np.transpose(valid, (2, 0, 1))
-
-
-class MaskedCubeDataset(Dataset):
-    """
-    Il dataset di valutazione piu' la maschera nuvole dei frame target,
-    "cloud_mask" (n_target, 1, H, W), 1 = pixel valido, alla stessa risoluzione
-    delle immagini: con data.params.resize < 128 si usa l'interpolazione area come
-    per le immagini e un pixel e' valido solo se lo sono tutti i suoi sotto-pixel.
-    """
-
-    def __init__(self, inner: Dataset, sources: MaskSources, n_target: int,
-                 threshold: float, prob_scale: float, resize: Optional[int]):
-        self.inner = inner
-        self.sources = sources
-        self.n_target = n_target
-        self.threshold = threshold
-        self.prob_scale = prob_scale
-        self.resize = resize
-
-    def __len__(self) -> int:
-        return len(self.inner)
-
-    def __getitem__(self, idx: int) -> Dict:
-        item = self.inner[idx]
-        path, offset = self.sources[item["cube_path"]]
-        with np.load(path) as z:
-            hd = z["highresdynamic"][:, :, :, offset: offset + self.n_target]
-        if hd.shape[3] != self.n_target:
-            raise ValueError(f"{path}: {hd.shape[3]} frame target dal frame {offset}, "
-                             f"ne servono {self.n_target}")
-        mask = torch.from_numpy(valid_mask(hd, self.threshold, self.prob_scale)
-                                .astype(np.float32)).unsqueeze(1)          # (n, 1, H, W)
-        if self.resize is not None and tuple(mask.shape[-2:]) != (self.resize, self.resize):
-            mask = (F.interpolate(mask, size=(self.resize, self.resize), mode="area")
-                    >= 0.999).float()
-        item["cloud_mask"] = mask
-        return item
 
 
 def build_loader(cfg, files: List[Path], sources: MaskSources, args, n_context: int,
@@ -327,275 +247,8 @@ def predict_pixels(batch: Dict, bundle: viz.DitBundle, device: torch.device, n_t
 
 
 # ===========================================================================
-# 3. Da tensore del trainer a cubo EarthNet
-# ===========================================================================
-def to_cube(x: torch.Tensor, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
-    """
-    (T, C, H, W) normalizzato in [-1, 1] -> (H, W, C, T) in riflettanza [0, 1].
-
-    Prima l'inversa esatta della normalizzazione del dataloader (denormalize), poi il
-    clipping in [0, 1], applicato da CubeCalculator.load_file() a predizioni e target.
-    """
-    arr = viz.denormalize(x, lo, hi)                 # (T, C, H, W), riflettanza
-    arr = np.transpose(arr, (2, 3, 1, 0))            # (H, W, C, T)
-    np.nan_to_num(arr, copy=False, nan=0.0)
-    return np.clip(arr, 0.0, 1.0).astype(np.float32)
-
-
-def to_mask(m: Optional[torch.Tensor], shape: Tuple[int, int, int, int]) -> np.ndarray:
-    """
-    (T, 1, H, W) -> (H, W, C, T) float32, 1 = pixel valido, ripetuta sulle bande.
-    Con m=None (--no-cloud-mask) la maschera e' tutta a 1.
-    """
-    h, w, c, t = shape
-    if m is None:
-        return np.ones((h, w, c, t), dtype=np.float32)
-    arr = np.transpose(m.numpy().astype(np.float32), (2, 3, 1, 0))   # (H, W, 1, T)
-    return np.repeat(arr, c, axis=2)
-
-
-def ndvi(cube: np.ndarray) -> np.ndarray:
-    """(H, W, C, T) -> NDVI (H, W, 1, T), con la stessa epsilon del toolkit."""
-    red = cube[:, :, BAND_RED, :]
-    nir = cube[:, :, BAND_NIR, :]
-    return ((nir - red) / (nir + red + 1e-6))[:, :, np.newaxis, :]
-
-
-# ===========================================================================
-# 4. Sottopunteggi e MAE di un cubo
-# ===========================================================================
-def mad_score(preds: np.ndarray, targs: np.ndarray,
-              masks: np.ndarray) -> Optional[float]:
-    """
-    mad-score di un cubo, (H, W, C, T) -> [0, 1], 1 = migliore. Stesso numero di
-    CubeCalculator.MAD (differenza esatta 0), ~5x piu' veloce: niente debug_info, e
-    siccome x**s e' monotona per s > 0 la mediana delle distanze elevate e' la
-    mediana elevata, quindi basta np.partition per le statistiche d'ordine centrali
-    (una se n e' dispari, due mediate DOPO l'elevazione a potenza se e' pari).
-    """
-    dists = np.abs(preds - targs)[masks == 1]
-    n = dists.size
-    if n == 0:
-        return None
-
-    k = n // 2
-    if n % 2:
-        median = float(np.partition(dists, k)[k]) ** MAD_SCALING
-    else:
-        two = np.partition(dists, [k - 1, k])[k - 1:k + 1].astype(np.float64)
-        median = float((two ** MAD_SCALING).mean())
-
-    return float(max(0.0, min(1.0, 1.0 - median)))
-
-
-def emd_score(preds: np.ndarray, targs: np.ndarray,
-              masks: np.ndarray) -> Optional[float]:
-    """
-    emd-score di un cubo NDVI, (H, W, 1, T) -> [0, 1], 1 = migliore. Stessa formula e
-    stesso numero di CubeCalculator.EMD, ~12x piu' veloce.
-
-    Il W1 fra due distribuzioni empiriche 1-D e' l'integrale di |CDF_pred - CDF_targ|,
-    una somma finita sui salti delle CDF: i 2T valori di ogni pixel si ordinano una
-    volta sola (un argsort su (H*W, 2T)) portandosi dietro due indicatori interi, i
-    cumsum sono i conteggi delle CDF e W1 e' il prodotto scalare fra il loro scarto e
-    i delta fra valori consecutivi. Gli istanti mascherati del target vanno sul
-    massimo della riga (non a +inf, che darebbe delta infiniti per 0). Come nel
-    toolkit, i pixel con meno di due istanti validi nel target restano fuori dalla
-    media. None se non ne resta nessuno.
-    """
-    n_t = preds.shape[-1]
-    pred = np.reshape(preds, (-1, n_t)).astype(np.float64)
-    targ = np.reshape(targs, (-1, n_t)).astype(np.float64)
-    valid = np.reshape(masks, (-1, n_t)) == 1
-
-    counts = valid.sum(1)
-    usable = counts > 1
-    if not usable.any():
-        return None
-    pred, targ, valid = pred[usable], targ[usable], valid[usable]
-    counts = counts[usable].astype(np.float64)[:, np.newaxis]
-
-    top = np.maximum(pred.max(1), np.where(valid, targ, -np.inf).max(1))
-    targ = np.where(valid, targ, top[:, np.newaxis])
-
-    zeros = np.zeros(pred.shape, dtype=np.int8)
-    ones = np.ones(pred.shape, dtype=np.int8)
-    values = np.concatenate([pred, targ], axis=1)
-    from_pred = np.concatenate([ones, zeros], axis=1)
-    from_targ = np.concatenate([zeros, valid.astype(np.int8)], axis=1)
-
-    order = np.argsort(values, axis=1)
-    values = np.take_along_axis(values, order, axis=1)
-
-    def cdf(flags: np.ndarray, size) -> np.ndarray:
-        counted = np.cumsum(np.take_along_axis(flags, order, axis=1),
-                            axis=1, dtype=np.int32)[:, :-1]
-        return counted / size
-
-    gap = np.abs(cdf(from_pred, float(n_t)) - cdf(from_targ, counts))
-    dists = np.sum(gap * np.diff(values, axis=1), axis=1)
-
-    return float(max(0.0, min(1.0, 1.0 - (dists ** EMD_SCALING).mean())))
-
-
-def ssim_scores(preds: np.ndarray, targs: np.ndarray, masks: np.ndarray,
-                data_range: float) -> Tuple[Optional[float], Optional[float]]:
-    """
-    (ssim grezza, ssim-score) di un cubo, (H, W, C, T) -> due valori in [0, 1].
-
-    Riscrittura di CubeCalculator.SSIM, identica tranne il data_range esplicito e il
-    fatto che anche il valore pre-esponente viene restituito. Invariati: pixel
-    mascherati del target sostituiti con la predizione (la finestra 7x7 resta piena),
-    un frame entra nella media solo se e' valido per piu' del 70%, la media e'
-    elevata a SSIM_SCALING. (None, None) se nessun frame supera la soglia.
-    """
-    ssim_targs = np.where(masks, targs, preds)
-    new_shape = (-1, preds.shape[0], preds.shape[1])
-
-    def flatten(a: np.ndarray) -> np.ndarray:
-        """(H, W, C, T) -> (H, W, C*T): ogni banda di ogni frame e' un'immagine."""
-        return np.transpose(np.reshape(np.transpose(a, (3, 2, 0, 1)), new_shape), (1, 2, 0))
-
-    ssim_targs = flatten(ssim_targs)
-    ssim_preds = flatten(preds)
-    ssim_masks = flatten(masks)
-
-    running, counts = 0.0, 0
-    for i in range(ssim_targs.shape[-1]):
-        frame_mask = ssim_masks[:, :, i]
-        if frame_mask.sum() > SSIM_MIN_VALID_FRACTION * frame_mask.size:
-            running += structural_similarity(
-                ssim_targs[:, :, i], ssim_preds[:, :, i], data_range=data_range
-            )
-            counts += 1
-
-    if counts == 0:
-        return None, None
-    raw = max(0.0, running / counts)
-    return float(raw), float(raw ** SSIM_SCALING)
-
-
-def cube_subscores(preds: np.ndarray, targs: np.ndarray, masks: np.ndarray,
-                   ssim_data_range: float,
-                   scoring: str = "fast") -> Dict[str, Optional[float]]:
-    """
-    I quattro sottopunteggi ENS di un cubo, piu' la SSIM grezza. Tutti in [0, 1],
-    1 = migliore. OLS e' sempre la chiamata al toolkit (gia' vettorizzata sui pixel);
-    riceve copie perche' azzera in place le serie con meno di due istanti validi.
-    """
-    ndvi_preds, ndvi_targs = ndvi(preds), ndvi(targs)
-    ndvi_masks = masks[:, :, :1, :]
-
-    ols, _ = CubeCalculator.OLS(ndvi_preds.copy(), ndvi_targs.copy(), ndvi_masks.copy())
-
-    if scoring == "toolkit":
-        mad, _ = CubeCalculator.MAD(preds.copy(), targs.copy(), masks.copy())
-        emd, _ = CubeCalculator.EMD(ndvi_preds.copy(), ndvi_targs.copy(),
-                                    ndvi_masks.copy())
-    else:
-        mad = mad_score(preds, targs, masks)
-        emd = emd_score(ndvi_preds, ndvi_targs, ndvi_masks)
-
-    ssim_raw, ssim = ssim_scores(preds, targs, masks, ssim_data_range)
-
-    return {"MAD": mad, "OLS": ols, "EMD": emd,
-            "SSIM": ssim, "SSIM_RAW": ssim_raw}
-
-
-def cube_errors(preds: np.ndarray, targs: np.ndarray,
-                masks: np.ndarray) -> Dict[str, float]:
-    """
-    Somme e conteggi di P-MAE e N-MAE per un cubo. Somme e non medie perche'
-    l'aggregato e' pesato sui pixel validi: la media delle medie darebbe lo stesso
-    peso a un cubo quasi tutto nuvoloso e a uno sgombro.
-    """
-    valid = masks == 1
-    p_abs = np.abs(preds - targs)[valid]
-
-    ndvi_valid = masks[:, :, 0, :] == 1
-    n_abs = np.abs(ndvi(preds) - ndvi(targs))[:, :, 0, :][ndvi_valid]
-
-    return {
-        "p_sum": float(p_abs.sum()), "p_count": int(p_abs.size),
-        "n_sum": float(n_abs.sum()), "n_count": int(n_abs.size),
-    }
-
-
-def harmonic_mean(values: Sequence[Optional[float]]) -> Optional[float]:
-    """
-    Media armonica dei sottopunteggi, come EarthNetScore.__harmonic_mean. Il filtro
-    e' quello del toolkit: scarta i None e, per effetto di filter(None, ...), anche
-    gli zeri esatti; lo si mantiene per non spostare la scala dei punteggi pubblicati.
-    """
-    vals = [v for v in values if v]
-    if not vals:
-        return None
-    return min(1.0, len(vals) / sum(1.0 / (v + 1e-8) for v in vals))
-
-
-def score_cube(pred_cubes: Sequence[np.ndarray], targs: np.ndarray,
-               masks: np.ndarray, ssim_data_range: float,
-               scoring: str = "fast") -> Dict[str, object]:
-    """
-    Riga di risultati di un cubo: sottopunteggi, ENS, somme di P-MAE e N-MAE. Con piu'
-    campioni si tiene quello con l'ENS piu' alto (best-of-K di
-    EarthNetScore.__get_best_sample); SSIM grezza e MAE sono quelle dello stesso
-    campione. Un cubo interamente nuvoloso non ha pixel su cui confrontare: i suoi
-    sottopunteggi restano None ed esce dalle medie.
-    """
-    if masks.sum() == 0:
-        return {"MAD": None, "OLS": None, "EMD": None, "SSIM": None,
-                "SSIM_RAW": None, "ENS": None,
-                "p_sum": 0.0, "p_count": 0, "n_sum": 0.0, "n_count": 0,
-                "valid_fraction": 0.0, "sample": -1}
-
-    best: Optional[Dict[str, object]] = None
-    for k, preds in enumerate(pred_cubes):
-        sub = cube_subscores(preds, targs, masks, ssim_data_range, scoring)
-        ens = harmonic_mean([sub["MAD"], sub["OLS"], sub["EMD"], sub["SSIM"]])
-        better = best is None or (
-            ens is not None and (best["ENS"] is None or ens > best["ENS"])
-        )
-        if better:
-            best = {**sub, "ENS": ens, "sample": k,
-                    **cube_errors(preds, targs, masks)}
-
-    best["valid_fraction"] = float(masks.mean())
-    return best
-
-
-# ===========================================================================
 # 5. Aggregazione, salvataggio, report
 # ===========================================================================
-def aggregate(rows: Sequence[Dict[str, object]]) -> Dict[str, Optional[float]]:
-    """
-    Dai risultati per cubo ai numeri finali. I quattro sottopunteggi si mediano sui
-    cubi e l'ENS e' la media armonica delle quattro medie (non la media degli ENS per
-    cubo: e' l'ordine di EarthNetScore.summarize()). SSIM_RAW e' mediata allo stesso
-    modo ma resta fuori dall'ENS. P-MAE e N-MAE sono medie pesate sui pixel validi.
-    """
-    def mean_of(key: str) -> Optional[float]:
-        vals = [r[key] for r in rows if r[key] is not None]
-        return float(np.mean(vals)) if vals else None
-
-    mad, ols, emd, ssim = (mean_of(k) for k in ("MAD", "OLS", "EMD", "SSIM"))
-    ssim_raw = mean_of("SSIM_RAW")
-
-    p_sum = sum(float(r["p_sum"]) for r in rows)
-    p_count = sum(int(r["p_count"]) for r in rows)
-    n_sum = sum(float(r["n_sum"]) for r in rows)
-    n_count = sum(int(r["n_count"]) for r in rows)
-
-    return {
-        "ENS": harmonic_mean([mad, ols, emd, ssim]),
-        "MAD": mad, "OLS": ols, "EMD": emd, "SSIM": ssim, "SSIM_RAW": ssim_raw,
-        "P_MAE": p_sum / p_count if p_count else None,
-        "N_MAE": n_sum / n_count if n_count else None,
-        "valid_fraction": (float(np.mean([r["valid_fraction"] for r in rows]))
-                           if rows else None),
-    }
-
-
 def save_results(out_dir: Path, split: str, n_samples: int,
                  payload: Dict[str, object]) -> Tuple[Path, Path]:
     """
@@ -749,17 +402,8 @@ def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
         t_infer += time.time() - t_batch
 
         t_batch = time.time()
-        for b in range(target.shape[0]):
-            targ_cube = to_cube(target[b], lo, hi)
-            mask_cube = to_mask(None if cloud is None else cloud[b], targ_cube.shape)
-            pred_cubes = [to_cube(q[b], lo, hi) for q in preds]
-
-            row = score_cube(pred_cubes, targ_cube, mask_cube, args.ssim_data_range, args.scoring)
-            cube = Path(str(cube_paths[b]))
-            row["cube"] = f"{cube.parent.name}/{cube.name}"
-            row["P_MAE"] = row["p_sum"] / row["p_count"] if row["p_count"] else None
-            row["N_MAE"] = row["n_sum"] / row["n_count"] if row["n_count"] else None
-            rows.append(row)
+        rows.extend(score_batch(preds, target, cloud, cube_paths, lo, hi,
+                                args.ssim_data_range, args.scoring))
         t_score += time.time() - t_batch
 
         done = len(rows)

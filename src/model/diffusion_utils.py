@@ -41,6 +41,7 @@ from src.model.sgm.modules.diffusionmodules.metric import EarthnetX_Metric
 from src.model.sgm.util import get_obj_from_str, default
 from src.training.run_outputs import (count_parameters, environment_info, relative_to_project,
                                       save_run_config, write_json)
+from src.training.ens_eval import ENS_KEYS, EnsEvaluator, wrap_with_cloud_mask
 from src.training.state import TrainState
 from src.utils.plots import plot_diffusion_history, plot_lead_time_rmse, save_forecast_grid
 
@@ -763,7 +764,16 @@ def log_videos_local_and_wandb(
         save_dir=None,
         save_counter=None,
         save_limit=0,
+        return_all_samples=False,
 ):
+    """
+    Forecast of a batch of validation cubes and the accumulators of the validation
+    RMSEs (sums, see VAL_SUM_KEYS). With return_all_samples the K = val_num_samples predictions of every cube
+    are decoded to pixels and returned in forecast["pred_samples"] (a list of K
+    (B, T, C, H, W) tensors in [-1, 1], the first one is forecast["pred"]): the ENS
+    keeps the best of them. Without it only the first one is decoded, the other K-1
+    stay in the latent space for the latent RMSEs.
+    """
     device = batch[input_key].device
     weight_dtype = batch[input_key].dtype
 
@@ -789,6 +799,8 @@ def log_videos_local_and_wandb(
             if not torch.is_tensor(out):
                 out = out.sample
         return out.to(input_tensor.dtype)
+
+    extra_pixel_samples = []     # the samples 2..K in pixels, only with return_all_samples
 
     def validate_and_log(
             batch,
@@ -935,6 +947,13 @@ def log_videos_local_and_wandb(
             per_cube_se.append(torch.sum((extra - fut) ** 2, dim=(1, 2, 3, 4),
                                          dtype=torch.float64))
             latent_sum += extra
+            if return_all_samples:
+                extra_pixel_samples.append(torch.clamp(
+                    decode_first_stage(first_stage_model,
+                                       rearrange(extra.to(device, dtype=weight_dtype),
+                                                 "b t c h w -> (b t) c h w").contiguous()
+                                       ).view(B, noise_image_num, C, H, W),
+                    -1.0, 1.0))
         predict_se = torch.stack(per_sample_se).mean()
         mean_latent = latent_sum / float(val_num_samples)
         mean_k_se = torch.sum((mean_latent - fut) ** 2, dtype=torch.float64)
@@ -993,6 +1012,8 @@ def log_videos_local_and_wandb(
             "context": context,
             "target": target,
             "pred": pred,
+            # the K predictions (see return_all_samples); only the first one without it
+            "pred_samples": [pred] + extra_pixel_samples,
         }
 
         # Ordine fisso, e' la chiave con cui il chiamante somma: vedi VAL_SUM_KEYS.
@@ -1027,6 +1048,11 @@ def log_videos_local_and_wandb(
     conditioner.train()
     # return btach_metric_rgbn, btach_metric_ndvi, batch_upper_limit_rgbn, batch_upper_limit_ndvi, batch_mean_rgbn, batch_mean_ndvi, batch_decode_mean_rgbn, batch_decode_mean_ndvi, validate_log
     return validate_log, batch_sums, forecast
+
+
+def _fmt_ens(value):
+    """An ENS statistic for the log: 6 decimals, or n/a when the cubes gave none."""
+    return "n/a" if value is None else f"{value:.6f}"
 
 
 def count_params(m: torch.nn.Module):
@@ -1126,6 +1152,12 @@ def setup_dataloader(cfg,
     with accelerator.main_process_first():
         datamodule.setup("fit")
     train_dataloader = datamodule.train_dataloader()
+    # ens.validation: the validation cubes also carry the cloud mask of their target
+    # frames (read from the original .npz), to leave the cloudy pixels out of the ENS.
+    # The model never sees it: train_loop takes it out of the batch.
+    if (cfg.ens.enabled and cfg.ens.validation and cfg.ens.cloud_mask
+            and datamodule.val_dataset is not None):
+        datamodule.val_dataset = wrap_with_cloud_mask(datamodule.val_dataset, cfg.ens)
     val_dataloader = datamodule.val_dataloader()
     if val_dataloader is None:
         raise RuntimeError(
@@ -1641,6 +1673,11 @@ def training_info(cfg,
                          **state.best_val_metrics},
             "lead_time_rmse": {"last": state.val_lead_time or None,
                                "best": state.best_val_lead_time or None},
+            # ENS statistics (config section `ens`): last validation, last training sample
+            "ens": ({"val_last": state.ens_val or None,
+                     "train_last": state.ens_train or None,
+                     "samples_per_cube": cfg.run.val_num_samples}
+                    if cfg.ens.enabled else None),
         },
         "compute": {
             "wall_time_s": wall_seconds,
@@ -1822,6 +1859,20 @@ def train_loop(cfg,
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / config_accelerate.gradient_accumulation_steps)
     # the columns of the validation metrics, also on the epochs without one
     val_keys = list(validation_rmse([0.0] * len(VAL_SUM_KEYS)))
+
+    # ENS (config section `ens`): scoring of the forecasts, shared with evaluate_ens.py.
+    # ens_columns = the columns it adds to history.csv, empty (they stay empty on the
+    # epochs where nothing is scored, so the header never changes).
+    ens_cfg = cfg.ens
+    ens_eval = EnsEvaluator(cfg, accelerator, train_dataloader) if ens_cfg.enabled else None
+    ens_columns = ens_eval.columns() if ens_eval is not None else {}
+    if ens_eval is not None:
+        logger.info(f"[ens] on: validation={ens_cfg.validation}, train={ens_cfg.train}"
+                    + (f" ({ens_cfg.train_cubes} cubes every {ens_cfg.train_every_epochs} "
+                       f"epoch(s), {'fixed' if ens_cfg.train_fixed_subset else 'random'} sample)"
+                       if ens_cfg.train else "")
+                    + f" | K={args.val_num_samples} predictions per cube, best kept"
+                    f" | cloud mask {'on' if ens_cfg.cloud_mask else 'off'}")
 
     write_training_info(cfg,
                         rt,
@@ -2011,6 +2062,9 @@ def train_loop(cfg,
         val_rmse = None
         n_cubes = None
         val_seconds = None
+        ens_row = dict(ens_columns)             # what the ENS adds to this epoch's history row
+        if ens_eval is not None:
+            ens_eval.scoring_seconds = 0.0
         if (epoch % config_accelerate.validate_epoch_interval == 0 or is_last_epoch
                 or args.validate_only):
             validate_start_time = time.time()  # <--- START TIMER INFERENZA
@@ -2028,6 +2082,9 @@ def train_loop(cfg,
             lead_totals = torch.zeros(3, noise_image_num, device=accelerator.device,
                                       dtype=torch.float64)
             n_val_batches = 0
+            # ENS: one row per cube, filled batch by batch with the forecasts the RMSEs
+            # already need (no second inference)
+            ens_val_rows = [] if (ens_eval is not None and ens_cfg.validation) else None
 
             # Immagini di confronto, un PNG per cubo (ground truth sopra,
             # predizione sotto, con il nome del .npz di origine), solo
@@ -2052,6 +2109,7 @@ def train_loop(cfg,
             for batch_num, batch in enumerate(val_dataloader):
                 if batch_num >= config_accelerate.validate_batch_num:
                     break
+                cloud = batch.pop("cloud_mask", None)    # for the ENS only, not for the model
                 for batch_key in batch.keys():
                     if torch.is_tensor(batch[batch_key]):
                         batch[batch_key] = batch[batch_key].to(dtype=weight_dtype)
@@ -2073,7 +2131,11 @@ def train_loop(cfg,
                     metrics_rgbn=validate_metric_rgbn,
                     metrics_ndvi=validate_metric_ndvi,
                     metrics_arvi=validate_metric_arvi,
+                    return_all_samples=ens_val_rows is not None,
                 )
+                if ens_val_rows is not None:
+                    ens_eval.add_batch(ens_val_rows, forecast["pred_samples"],
+                                       forecast["target"], cloud, batch.get("cube_path"))
                 val_totals += batch_sums
                 lead_totals[0] += forecast["lead_se"]
                 lead_totals[1] += forecast["lead_baseline_se"]
@@ -2113,6 +2175,16 @@ def train_loop(cfg,
             val_rmse = validation_rmse(val_totals)
             n_cubes = int(val_totals[VAL_SUM_KEYS.index("n_cubes")])
             lead_rmse = torch.sqrt(lead_totals[:2] / lead_totals[2].clamp(min=1)).tolist()
+            if ens_val_rows is not None:
+                ens_row.update(ens_eval.finish(ens_val_rows, "val"))
+                state.ens_val = {"epoch": epoch + 1,
+                                 **{k: ens_row[f"val_{k}"] for k in ENS_KEYS},
+                                 "n_cubes": ens_row["val_ens_n_cubes"]}
+                logger.info(f"[validation] ENS={_fmt_ens(ens_row['val_ENS'])} "
+                            f"(MAD={_fmt_ens(ens_row['val_MAD'])} OLS={_fmt_ens(ens_row['val_OLS'])} "
+                            f"EMD={_fmt_ens(ens_row['val_EMD'])} SSIM={_fmt_ens(ens_row['val_SSIM'])}) "
+                            f"P-MAE={_fmt_ens(ens_row['val_P_MAE'])} N-MAE={_fmt_ens(ens_row['val_N_MAE'])} | "
+                            f"{ens_row['val_ens_n_cubes']} cubes, best of K={args.val_num_samples}")
             val_seconds = time.time() - validate_start_time
 
             state.metrics.record_validation(val_rmse, n_cubes, epoch + 1,
@@ -2178,6 +2250,55 @@ def train_loop(cfg,
                     f"migliora il minimo {state.best_latter_rmse:.6f}, niente da salvare"
                 )
 
+        # --- ENS on a sample of training cubes -------------------------------------
+        # Full sampling of ens.train_cubes cubes (no flip, eval mode), as in validation:
+        # it says how far the model is from its own training cubes. It is inference, so it
+        # goes into state.metrics.inference_time and not into the training time.
+        if (ens_eval is not None and ens_cfg.train and not args.validate_only
+                and ((epoch + 1) % ens_cfg.train_every_epochs == 0 or is_last_epoch)):
+            train_eval_start = time.time()
+            ens_train_rows = []
+            for batch in ens_eval.train_loader(epoch):
+                cloud = batch.pop("cloud_mask", None)
+                batch = ens_eval.to_device(batch)
+                for batch_key in batch.keys():
+                    if torch.is_tensor(batch[batch_key]):
+                        batch[batch_key] = batch[batch_key].to(dtype=weight_dtype)
+                _, _, forecast = log_videos_local_and_wandb(
+                    batch=batch,
+                    model=model,
+                    conditioner=conditioner,
+                    first_stage_model=first_stage_model,
+                    sampler=sampler,
+                    denoiser=denoiser,
+                    input_key=config_diffusion.input_key,
+                    config_diffusion=config_diffusion,
+                    noise_image_num=noise_image_num,
+                    past_weigth=config_diffusion.loss_fn_config.params.past_weight,
+                    val_num_samples=args.val_num_samples,
+                    metrics_rgbn=None,
+                    metrics_ndvi=None,
+                    metrics_arvi=None,
+                    return_all_samples=True,
+                )
+                ens_eval.add_batch(ens_train_rows, forecast["pred_samples"],
+                                   forecast["target"], cloud, batch.get("cube_path"))
+            ens_row.update(ens_eval.finish(ens_train_rows, "train"))
+            ens_row["ens_train_eval_time_s"] = time.time() - train_eval_start
+            state.metrics.inference_time += ens_row["ens_train_eval_time_s"]
+            state.ens_train = {"epoch": epoch + 1,
+                               **{k: ens_row[f"train_{k}"] for k in ENS_KEYS},
+                               "n_cubes": ens_row["train_ens_n_cubes"]}
+            logger.info(f"[ens] epoch {epoch + 1} | TRAIN sample: ENS={_fmt_ens(ens_row['train_ENS'])} "
+                        f"(MAD={_fmt_ens(ens_row['train_MAD'])} OLS={_fmt_ens(ens_row['train_OLS'])} "
+                        f"EMD={_fmt_ens(ens_row['train_EMD'])} SSIM={_fmt_ens(ens_row['train_SSIM'])}) "
+                        f"P-MAE={_fmt_ens(ens_row['train_P_MAE'])} N-MAE={_fmt_ens(ens_row['train_N_MAE'])} | "
+                        f"{ens_row['train_ens_n_cubes']} cubes, best of K={args.val_num_samples}, "
+                        f"{ens_row['ens_train_eval_time_s']:.0f}s")
+
+        if ens_eval is not None:
+            ens_row["ens_scoring_time_s"] = ens_eval.scoring_seconds or None
+
         if accelerator.is_main_process:
             # the K-sample columns only when K > 1: with K = 1 they repeat predict_latent_rmse
             multi_sample = args.val_num_samples > 1
@@ -2194,6 +2315,7 @@ def train_loop(cfg,
                 "epoch_train_time_s": train_seconds if epoch_steps else None,
                 "epoch_val_time_s": val_seconds,
                 "train_cubes_per_s": epoch_cubes / train_seconds if epoch_steps else None,
+                **ens_row,
             }
             append_history_row(state.history_csv,
                                history_row)

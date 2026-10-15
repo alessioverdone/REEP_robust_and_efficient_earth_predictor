@@ -191,6 +191,22 @@ def compute_batch_psnr(recon, target, data_range=2.0, eps=1e-12):
 def append_history_row(csv_path, row_dict):
     file_exists = os.path.exists(csv_path)
 
+    if file_exists:
+        # a row with columns the file does not have yet (e.g. the ENS columns, in a
+        # run resumed from a history written without them): the file is rewritten
+        # with the wider header, the old rows keep their cells and get empty ones
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            header = list(reader.fieldnames or [])
+            old_rows = list(reader) if set(row_dict) - set(header) else []
+        new_columns = [k for k in row_dict if k not in header]
+        if new_columns:
+            header += new_columns
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=header)
+                writer.writeheader()
+                writer.writerows(old_rows)
+
     with open(csv_path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(row_dict.keys()))
 

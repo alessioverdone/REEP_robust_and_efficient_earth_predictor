@@ -99,6 +99,9 @@ import torch  # noqa: E402
 from accelerate.utils import set_seed  # noqa: E402
 
 from src.config import PathsCfg, project_path, use_project_dir  # noqa: E402
+# lo scoring ENS sta in src/utils/ens_metrics.py, condiviso con il training loop
+# e con evaluate_ens.py (che qui serve ancora per build_split e build_loader)
+from src.utils import ens_metrics as em  # noqa: E402
 
 log = logging.getLogger("evaluate_ae_ens")
 
@@ -262,11 +265,11 @@ def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path, ae
 
         t_batch = time.time()
         for b in range(target.shape[0]):
-            targ_cube = ens.to_cube(target[b], lo, hi)
-            mask_cube = ens.to_mask(None if cloud is None else cloud[b], targ_cube.shape)
-            pred_cubes = [ens.to_cube(r[b], lo, hi) for r in recons]
+            targ_cube = em.to_cube(target[b], lo, hi)
+            mask_cube = em.to_mask(None if cloud is None else cloud[b], targ_cube.shape)
+            pred_cubes = [em.to_cube(r[b], lo, hi) for r in recons]
 
-            row = ens.score_cube(pred_cubes, targ_cube, mask_cube, args.ssim_data_range,
+            row = em.score_cube(pred_cubes, targ_cube, mask_cube, args.ssim_data_range,
                                  args.scoring)
             # MAE e MSE dello stesso campione scelto per l'ENS
             sq = (squared_error_sum(pred_cubes[row["sample"]], targ_cube, mask_cube)
@@ -289,7 +292,7 @@ def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path, ae
     if not rows:
         raise SystemExit(f"[{spec.name}] nessun cubo valutato.")
 
-    agg = ens.aggregate(rows)
+    agg = em.aggregate(rows)
     p_count = sum(int(r["p_count"]) for r in rows)
     agg["MAE"] = agg.pop("P_MAE")
     agg["MSE"] = sum(float(r["mse_sum"]) for r in rows) / p_count if p_count else None
@@ -338,13 +341,13 @@ def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path, ae
             "cloud_prob_threshold": float(args.cloud_prob_threshold),
             "cloud_prob_scale": float(args.cloud_prob_scale),
             "ssim_data_range": float(args.ssim_data_range),
-            "ssim_scaling": ens.SSIM_SCALING,
+            "ssim_scaling": em.SSIM_SCALING,
         },
         "aggregate": agg,
         "per_cube": rows,
     }
 
-    json_path, csv_path = save_results(run_dir / "results" / ens.STATISTICS_DIRNAME,
+    json_path, csv_path = save_results(run_dir / "results" / em.STATISTICS_DIRNAME,
                                        spec.name, int(args.num_samples), payload)
     print_report(payload)
     log.info(f"[out] {json_path}")
@@ -389,17 +392,17 @@ def parse_args():
                    help="worker del DataLoader (default: data.params.num_workers del config)")
     p.add_argument("--merge-workers", type=int, default=8,
                    help="thread per la fusione context+target degli split EarthNet")
-    p.add_argument("--scoring", choices=ens.SCORING_MODES, default="fast",
+    p.add_argument("--scoring", choices=em.SCORING_MODES, default="fast",
                    help="implementazione di MAD ed EMD: 'fast' (vettorizzate) o 'toolkit' "
                         "(originali di earthnet). Stesso numero")
     p.add_argument("--no-cloud-mask", dest="cloud_mask", action="store_false",
                    help="misura su TUTTI i pixel, nuvole comprese. Sconsigliato: sotto le "
                         "nuvole il target non e' la superficie")
-    p.add_argument("--cloud-prob-threshold", type=float, default=ens.CLOUD_PROB_THRESHOLD,
+    p.add_argument("--cloud-prob-threshold", type=float, default=em.CLOUD_PROB_THRESHOLD,
                    help="cubi a 7 canali: un pixel e' valido se cloud probability < soglia")
-    p.add_argument("--cloud-prob-scale", type=float, default=ens.CLOUD_PROB_SCALE,
+    p.add_argument("--cloud-prob-scale", type=float, default=em.CLOUD_PROB_SCALE,
                    help="fondo scala del canale cloud probability (100 = percentuale)")
-    p.add_argument("--ssim-data-range", type=float, default=ens.SSIM_DATA_RANGE,
+    p.add_argument("--ssim-data-range", type=float, default=em.SSIM_DATA_RANGE,
                    help="data_range della SSIM. 2.0 e' quello di evaluate_ens.py (numeri "
                         "confrontabili con il DiT); 1.0 e' l'ampiezza reale della riflettanza")
     p.add_argument("--seed", type=int, default=42,
@@ -464,7 +467,7 @@ def main() -> None:
     print(f"device      : {device}")
     print(f"split       : {', '.join(s.name for s in args.split)} | K={args.num_samples} | "
           f"seed {args.seed}")
-    print(f"output      : {(run_dir / 'results' / ens.STATISTICS_DIRNAME).as_posix()}")
+    print(f"output      : {(run_dir / 'results' / em.STATISTICS_DIRNAME).as_posix()}")
     print("=" * 78)
 
     payloads: List[Dict[str, object]] = []

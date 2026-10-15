@@ -726,6 +726,38 @@ class AccelerateCfg:
     validate_batch_num: int = 10000
 
 
+# ================================================= ENS =================================================
+# Metriche EarthNet (ENS con MAD, OLS, EMD, SSIM, piu' SSIM_RAW, P-MAE e N-MAE) calcolate
+# durante il training di fase 2, le stesse di src/scripts/evaluate_ens.py (il codice sta
+# in src/utils/ens_metrics.py). Servono predizioni vere, cioe' il sampling completo:
+# per questo si fanno solo dove si fa gia' inferenza, non sui batch di training.
+# Ogni cubo e' predetto run.val_num_samples (K) volte e di ognuno si tiene la predizione
+# con l'ENS piu' alto (best-of-K). Le colonne finiscono in history.csv (val_ENS, ...,
+# train_ENS, ...) e nei grafici results/curves/ens*.png.
+
+@dataclass
+class EnsCfg:
+    enabled: bool = False                   # false = niente ENS (nessun costo)
+    validation: bool = True                 # ENS sul validation set, nelle epoche di validazione
+    train: bool = False                     # ENS anche su un campione di cubi di train
+    train_cubes: int = 100                  # quanti cubi di train per valutazione
+    train_every_epochs: int = 1             # ogni quante epoche (1 = a fine di ogni epoca)
+    # true = sempre gli stessi cubi (curve confrontabili tra epoche); false = un campione
+    # casuale nuovo a ogni valutazione
+    train_fixed_subset: bool = True
+    # 'fast' = MAD ed EMD vettorizzati di evaluate_ens.py (stesso numero), 'toolkit' = originali
+    scoring: str = "fast"
+    # data_range della SSIM: 2.0 e' quello con cui sono calibrati i punteggi pubblicati
+    ssim_data_range: float = 2.0
+    # true = i pixel nuvolosi sono esclusi dal confronto, come nello scoring ufficiale
+    # (la maschera si legge dai .npz originali, il modello non la vede); false = tutti i pixel
+    cloud_mask: bool = True
+    cloud_prob_threshold: float = 0.20      # sotto questa probabilita' di nuvola un pixel e' valido
+    cloud_prob_scale: float = 100.0         # fondo scala del canale (EarthNet la da' in %)
+
+    SCORING_MODES: ClassVar[tuple[str, ...]] = ("fast", "toolkit")
+
+
 # ================================================ WANDB ================================================
 # Live report of the training on Weights & Biases (src/training/tracking.py),
 # for both phases. The run folder under registry/outputs/ stays the reference:
@@ -759,6 +791,7 @@ class TrainCfg:
     diffusion: DiffusionCfg = field(default_factory=DiffusionCfg)
     data: DataCfg = field(default_factory=DataCfg)
     accelerate: AccelerateCfg = field(default_factory=AccelerateCfg)
+    ens: EnsCfg = field(default_factory=EnsCfg)
     wandb: WandbCfg = field(default_factory=WandbCfg)
 
 
@@ -1140,6 +1173,16 @@ def validate_config(cfg: TrainCfg) -> None:
                 errors.append(f"diffusion.{key} is only used with latent_normalization="
                               f"'shift_scale_per_channel': leave it null")
 
+    ens = cfg.ens
+    if ens.scoring not in EnsCfg.SCORING_MODES:
+        errors.append(f"ens.scoring={ens.scoring!r} must be one of {EnsCfg.SCORING_MODES}")
+    if ens.enabled and not (ens.validation or ens.train):
+        errors.append("ens.enabled=true but ens.validation and ens.train are both false: "
+                      "nothing would be computed")
+    if ens.train and (ens.train_cubes < 1 or ens.train_every_epochs < 1):
+        errors.append("ens.train_cubes and ens.train_every_epochs must be >= 1")
+    if ens.enabled and cfg.run.val_num_samples < 1:
+        errors.append("run.val_num_samples must be >= 1")
     if cfg.autoencoder.early_stopping_patience < 0 or cfg.autoencoder.early_stopping_min_delta < 0:
         errors.append("autoencoder.early_stopping_patience and "
                       "autoencoder.early_stopping_min_delta must be >= 0")
