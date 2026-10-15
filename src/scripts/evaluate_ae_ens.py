@@ -25,10 +25,9 @@ Argomenti principali
           registry/outputs/autoencoder/ (anche un pezzo del nome se e' unico,
           'latest' o il percorso della cartella).
 --split   uno o piu' fra
-              train, val, test     split di dataset.json (cubi da data/raw/train);
+              train, val           split di dataset.json (cubi da data/raw/train);
                                    sono gli stessi che il VAE ha visto in training
-                                   (train), usato per la scelta del best (val) e
-                                   tenuto fuori (test)
+                                   (train) e usato per la scelta del best (val)
               iid, ood, extreme    split di test EarthNet: data/raw/<split>_test_split/
                                    {context,target}
               seasonal             come sopra, ma con finestre piu' lunghe
@@ -39,7 +38,7 @@ Argomenti principali
 Quali frame
 -----------
 Si ricostruiscono i frame TARGET dello split, cioe' gli stessi che il DiT deve
-predire: 20 per train / val / test / iid / ood / extreme, 40 per seasonal. Il VAE
+predire: 20 per train / val / iid / ood, 40 per extreme, 140 per seasonal. Il VAE
 ricostruisce ogni frame da solo, quindi il contesto serve solo a fare uscire i
 cubi dal dataloader del DiT (stesse finestre di evaluate_ens.py).
 
@@ -88,10 +87,6 @@ from typing import Dict, List, Sequence, Tuple
 # src/model su sys.path, e serve prima di ogni import `src.` o `sgm.`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import inference_visualization as viz  # noqa: E402
-
-# evaluate_ens.py importa il modulo con il suo vecchio nome (visualize_predictions):
-# lo stesso modulo, ribattezzato inference_visualization.
-sys.modules.setdefault("visualize_predictions", viz)
 import evaluate_ens as ens  # noqa: E402
 
 import numpy as np  # noqa: E402
@@ -140,13 +135,14 @@ def squared_error_sum(pred: np.ndarray, targ: np.ndarray, masks: np.ndarray) -> 
 # 2. Salvataggio e report
 # ===========================================================================
 def save_results(out_dir: Path, split: str, n_samples: int,
-                 payload: Dict[str, object]) -> Tuple[Path, Path]:
+                 payload: Dict[str, object], suffix: str = "") -> Tuple[Path, Path]:
     """
-    metrics_results_<split>_K_<K>.json (aggregati + metadati + per cubo) e .csv (una
-    riga per cubo) in <run>/results/statistics/. Riscritti a ogni esecuzione.
+    metrics_results_<split>_K_<K>[<suffix>].json (aggregati + metadati + per cubo) e .csv
+    (una riga per cubo) in <run>/results/statistics/. Riscritti a ogni esecuzione; il
+    suffisso (ens.selection_suffix) distingue una valutazione parziale dallo split intero.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"metrics_results_{split}_K_{n_samples}"
+    stem = f"metrics_results_{split}_K_{n_samples}{suffix}"
 
     json_path = out_dir / f"{stem}.json"
     viz.write_json(str(json_path), payload)
@@ -348,7 +344,8 @@ def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path, ae
     }
 
     json_path, csv_path = save_results(run_dir / "results" / em.STATISTICS_DIRNAME,
-                                       spec.name, int(args.num_samples), payload)
+                                       spec.name, int(args.num_samples), payload,
+                                       ens.selection_suffix(args))
     print_report(payload)
     log.info(f"[out] {json_path}")
     log.info(f"[out] {csv_path}")
@@ -370,7 +367,7 @@ def parse_args():
                         "'latest' o il percorso della cartella")
     p.add_argument("--split", type=viz.split_arg, nargs="+", metavar="SPLIT",
                    help=f"uno o piu' fra: {', '.join(viz.SPLITS)} (anche iid_test_split, ...). "
-                        f"seasonal usa 20 frame di contesto e 40 di target")
+                        f"extreme usa 20 frame di contesto e 40 di target, seasonal 70 e 140")
     p.add_argument("--list-runs", action="store_true",
                    help="stampa i run di autoencoder disponibili ed esce")
     p.add_argument("--checkpoint", type=str, default="best",

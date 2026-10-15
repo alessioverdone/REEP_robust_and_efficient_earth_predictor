@@ -221,10 +221,12 @@ def plot_diffusion_history(history_csv: str,
         return
 
     _epoch_figure(history,
-                  (("train_loss", "train", "-"),),
+                  (("train_loss", "train", "-"),
+                   ("val_loss", "val (diffusion.save_best_by=loss)", "-")),
                   ylabel="loss",
                   title="diffusion loss",
-                  path=os.path.join(out_dir, "loss.png"))
+                  path=os.path.join(out_dir, "loss.png"),
+                  best_epoch=best_epoch)
     _epoch_figure(history,
                   (("train_latent_rmse", "train (one denoising step)", "-"),
                    ("val_predict_latent_rmse", "val (sampled)", "-"),

@@ -639,7 +639,7 @@ def train_vae(cfg,
         validate_start_time = time.time()
         val_metrics, n_val_images = evaluate_vae(cfg, rt, vae, loaders["val"])
         val_seconds = time.time() - validate_start_time
-        state.metrics.record_validation(val_metrics, n_val_images, epoch,
+        state.metrics.record_validation(val_metrics, n_val_images, epoch + 1,
                                         state.global_step,
                                         val_seconds)
         state.train_metrics = train_metrics

@@ -21,6 +21,7 @@ con l'ENS piu' alto (best-of-K, come evaluate_ens.py --num-samples K).
 
 import copy
 import gc
+import importlib
 import logging
 import os
 import random
@@ -82,7 +83,11 @@ def evaluate_test_splits(cfg, rt, outputs, state):
     try:
         # lazy: the script pulls in the whole inference stack (and edits sys.path)
         from src.scripts import evaluate_ens
-        payloads = evaluate_ens.evaluate_run(evaluate_ens.parse_args(argv))
+        # raise_on_failure=False: a split that cannot be evaluated (e.g. its folder is
+        # missing) is logged by the script, and the splits that did get evaluated are
+        # still reported here instead of being thrown away with the failure
+        payloads = evaluate_ens.evaluate_run(evaluate_ens.parse_args(argv),
+                                             raise_on_failure=False)
     except (Exception, SystemExit) as error:     # noqa: BLE001 - never lose a finished run
         logger.exception(f"[test_eval] failed, run kept as completed: {error}")
         return None
@@ -92,25 +97,52 @@ def evaluate_test_splits(cfg, rt, outputs, state):
         rt.tracker.summary({f"test/{split}/{key}": value
                             for key, value in payload["aggregate"].items()
                             if isinstance(value, (int, float))})
-    logger.info(f"[test_eval] {len(payloads)} splits evaluated in {time.time() - start:.0f}s, "
-                f"results in {os.path.join(outputs.results, 'statistics')}")
+    message = (f"[test_eval] {len(payloads)}/{len(test_eval.splits)} splits evaluated in "
+               f"{time.time() - start:.0f}s, results in {os.path.join(outputs.results, 'statistics')}")
+    if len(payloads) < len(test_eval.splits):
+        logger.warning(message + " (the others failed: see the errors above)")
+    else:
+        logger.info(message)
     return payloads
 
 
 def release_gpu_memory(accelerator):
-    """Drops what the accelerator still references (the caller deletes its own names) and frees the cache."""
+    """
+    Drops what the accelerator still references (the caller deletes its own names) and
+    frees the cache. Whatever the caller still holds keeps its memory: the lr scheduler
+    refers to the optimizer, which refers to the parameters of the model.
+    """
     accelerator.free_memory()
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
+def check_ens_dependencies():
+    """
+    The ENS needs two packages that are imported lazily (earthnet for OLS, scikit-image
+    for the SSIM): a missing one would otherwise show up at the end of the first
+    epoch, or after the whole training for test_eval. Raises ImportError with the name.
+    """
+    for module, package in (("earthnet.parallel_score", "earthnet"),
+                            ("skimage.metrics", "scikit-image")):
+        try:
+            importlib.import_module(module)
+        except ImportError as error:
+            raise ImportError(f"the ENS needs the package '{package}' ({error}): "
+                              f"pip install {package}") from error
+
+
 def wrap_with_cloud_mask(dataset, ens_cfg):
     """
-    `dataset` (S2DiffusionCubeDataset con return_paths) piu' la chiave "cloud_mask" in
-    ogni item: i pixel validi dei frame target, letti dai .npz originali. I frame
-    target iniziano dopo il contesto (il dataset legge i primi T istanti di ogni cubo).
+    `dataset` (S2DiffusionCubeDataset) piu' la chiave "cloud_mask" in ogni item: i pixel
+    validi dei frame target, letti dai .npz originali. I frame target iniziano dopo il
+    contesto (il dataset legge i primi T istanti di ogni cubo).
+
+    MaskedCubeDataset trova il .npz di un item dal suo "cube_path": il dataset di train
+    non lo restituisce di default (solo quello di validation), quindi lo si accende qui.
     """
+    dataset.return_paths = True
     sources = {str(f): (Path(f), dataset.n_context) for f in dataset.files}
     return MaskedCubeDataset(dataset, sources, dataset.n_predict,
                              ens_cfg.cloud_prob_threshold, ens_cfg.cloud_prob_scale,
@@ -121,6 +153,7 @@ class EnsEvaluator:
     """Scoring dei cubi, scelta dei cubi di train e aggregazione tra i processi."""
 
     def __init__(self, cfg, accelerator, train_dataloader):
+        check_ens_dependencies()            # at the start of the run, not at the first validation
         self.cfg = cfg.ens
         self.k = int(cfg.run.val_num_samples)
         self.seed = int(cfg.run.seed)
@@ -150,7 +183,13 @@ class EnsEvaluator:
 
     # -- scoring ----------------------------------------------------------------
     def add_batch(self, rows: list, pred_samples, target, cloud, cube_paths) -> None:
-        """Scores the cubes of a batch (the K predictions of each) into `rows`."""
+        """
+        Scores the cubes of a batch (the K predictions of each) into `rows`. `cloud` is
+        used only with ens.cloud_mask: the loader can carry it for the loss too
+        (diffusion.loss_pixels=valid), and that must not decide what the ENS measures.
+        """
+        if not self.cfg.cloud_mask:
+            cloud = None
         start = time.time()
         rows.extend(score_batch(pred_samples, target, cloud, cube_paths, self.lo, self.hi,
                                 self.cfg.ssim_data_range, self.cfg.scoring))
@@ -186,7 +225,14 @@ class EnsEvaluator:
         files = list(self.train_dataset.files)
         rng = random.Random(self.seed if self.cfg.train_fixed_subset else self.seed + epoch)
         chosen = sorted(rng.sample(files, min(self.cfg.train_cubes, len(files))))
-        chosen = chosen[self.accelerator.process_index::self.accelerator.num_processes]
+        num_processes = self.accelerator.num_processes
+        share = -(-len(chosen) // num_processes)
+        mine = chosen[self.accelerator.process_index::num_processes]
+        # Every process gets the same number of cubes, hence of batches: the DiT is wrapped
+        # in DDP, whose forward synchronises the buffers also in eval mode, so a process
+        # with fewer batches would leave the others waiting for it. The cubes that complete
+        # a short share are repeats of other processes' cubes: unique_rows() counts them once.
+        chosen = mine + chosen[:share - len(mine)]
 
         dataset = copy.copy(self.train_dataset)
         dataset.files = chosen

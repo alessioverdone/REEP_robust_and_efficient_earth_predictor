@@ -19,7 +19,7 @@ Argomenti principali
 --model   nome del run addestrato = cartella con il timestamp sotto
           registry/outputs/diffusion/ (anche un pezzo del nome se e' unico,
           'latest' o il percorso della cartella). Stessa risoluzione di
-          visualize_predictions.py.
+          inference_visualization.py.
 --split   uno o piu' fra
               train, val           split di dataset.json (cubi da data/raw/train)
               iid, ood, extreme    split di test EarthNet: data/raw/<split>_test_split/
@@ -29,8 +29,12 @@ Argomenti principali
 
 Finestre temporali
 ------------------
-    train / val / iid / ood / extreme   10 frame di contesto + 20 target (T = 30)
-    seasonal                                    20 frame di contesto + 40 target (T = 60)
+    train / val / iid / ood   10 frame di contesto + 20 target (T = 30)
+    extreme                   20 frame di contesto + 40 target (T = 60)
+    seasonal                  70 frame di contesto + 140 target (T = 210)
+Sono le finestre dei file EarthNet2021 (un cubo con un numero di frame diverso ferma la
+valutazione dello split). Con extreme e seasonal il DiT lavora su sequenze piu' lunghe di
+quelle del training (T = 30), e il batch si riduce in proporzione (--batch-size per fissarlo).
 
 Cosa calcola
 ------------
@@ -68,7 +72,9 @@ registry/outputs/diffusion/<run>/results/statistics/
     metrics_results_<split>_K_<K>.json   aggregati + metadati (checkpoint, finestre,
                                          maschera, tempi) + una voce per cubo
     metrics_results_<split>_K_<K>.csv    una riga per cubo, per gli istogrammi
-Ogni esecuzione riscrive i file del proprio split e K, senza toccare gli altri.
+Ogni esecuzione riscrive i file del proprio split e K, senza toccare gli altri. Una
+valutazione parziale (--subset N / --max-cubes N) aggiunge il suffisso _subsetN / _firstN
+ai nomi, cosi' un giro di prova non sovrascrive i file dello split intero.
 """
 
 from __future__ import annotations
@@ -83,7 +89,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-# visualize_predictions.py sta nella stessa cartella: lo si importa da li' anche
+# inference_visualization.py sta nella stessa cartella: lo si importa da li' anche
 # quando lo script e' lanciato da un'altra cartella o da un IDE. Il suo import mette
 # anche la root del progetto e src/model su sys.path, e serve prima di ogni
 # import `src.` o `sgm.`.
@@ -249,14 +255,27 @@ def predict_pixels(batch: Dict, bundle: viz.DitBundle, device: torch.device, n_t
 # ===========================================================================
 # 5. Aggregazione, salvataggio, report
 # ===========================================================================
-def save_results(out_dir: Path, split: str, n_samples: int,
-                 payload: Dict[str, object]) -> Tuple[Path, Path]:
+def selection_suffix(args) -> str:
     """
-    metrics_results_<split>_K_<K>.json (aggregati + metadati + per cubo) e .csv (una
-    riga per cubo) in <run>/results/statistics/. Riscritti a ogni esecuzione.
+    '' per lo split intero; '_subset<N>' / '_first<N>' per una valutazione parziale
+    (--subset / --max-cubes): i suoi file non devono sovrascrivere quelli dello split
+    intero, che costano ore, e un giro di prova e' proprio il caso in cui capita.
+    """
+    if args.subset:
+        return f"_subset{args.subset}" + (f"_seed{args.subset_seed}" if args.subset_seed else "")
+    if args.max_cubes:
+        return f"_first{args.max_cubes}"
+    return ""
+
+
+def save_results(out_dir: Path, split: str, n_samples: int,
+                 payload: Dict[str, object], suffix: str = "") -> Tuple[Path, Path]:
+    """
+    metrics_results_<split>_K_<K>[<suffix>].json (aggregati + metadati + per cubo) e
+    .csv (una riga per cubo) in <run>/results/statistics/. Riscritti a ogni esecuzione.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"metrics_results_{split}_K_{n_samples}"
+    stem = f"metrics_results_{split}_K_{n_samples}{suffix}"
 
     json_path = out_dir / f"{stem}.json"
     viz.write_json(str(json_path), payload)
@@ -467,7 +486,8 @@ def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
     }
 
     json_path, csv_path = save_results(run_dir / "results" / STATISTICS_DIRNAME,
-                                       spec.name, int(args.num_samples), payload)
+                                       spec.name, int(args.num_samples), payload,
+                                       selection_suffix(args))
     print_report(payload)
     log.info(f"[out] {json_path}")
     log.info(f"[out] {csv_path}")
@@ -490,7 +510,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                         "'latest' o il percorso della cartella")
     p.add_argument("--split", type=viz.split_arg, nargs="+", metavar="SPLIT",
                    help=f"uno o piu' fra: {', '.join(viz.SPLITS)} (anche iid_test_split, ...). "
-                        f"seasonal usa 20 frame di contesto e 40 di target")
+                        f"extreme usa 20 frame di contesto e 40 di target, seasonal 70 e 140")
     p.add_argument("--list-runs", action="store_true",
                    help="stampa i run di diffusion disponibili ed esce")
     p.add_argument("--checkpoint", type=str, default="best",
@@ -541,12 +561,14 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     return p.parse_args(argv)
 
 
-def evaluate_run(args) -> List[Dict[str, object]]:
+def evaluate_run(args, raise_on_failure: bool = True) -> List[Dict[str, object]]:
     """
     Valuta il run args.model sugli split args.split e scrive i risultati in
     <run>/results/statistics/. E' il corpo di main(), richiamabile anche dal training
     (src/training/ens_eval.py) a fine loop. Ritorna i payload degli split valutati;
-    se qualcuno fallisce li valuta comunque tutti e poi solleva SystemExit.
+    se qualcuno fallisce li valuta comunque tutti e poi, con raise_on_failure (il
+    default, per la riga di comando), solleva SystemExit. Senza, ritorna i payload
+    di quelli riusciti: i fallimenti restano nel log e nel riepilogo stampato.
     """
     use_project_dir()
     family_dir = project_path(args.outputs_dir) / viz.FAMILY_DIRS["dit"]
@@ -606,7 +628,8 @@ def evaluate_run(args) -> List[Dict[str, object]]:
         print(f"{len(failed)} split NON valutati:")
         for name, reason in failed:
             print(f"  {name}: {reason.splitlines()[0]}")
-        raise SystemExit(1)
+        if raise_on_failure:
+            raise SystemExit(1)
     return payloads
 
 

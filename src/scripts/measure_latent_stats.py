@@ -24,35 +24,13 @@ import torch
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
 
-from src.config import TrainCfg, config_from_cli
+from src.config import TrainCfg, config_from_cli, known_keys_only
 from src.training.run_outputs import write_json
 from src.training.train_autoencoder import (compute_latent_stats, instantiate_autoencoder,
                                             log_latent_stats, setup_dataloader)
 from src.training.runtime import AutoencoderRuntime
 
 logger = logging.getLogger(__name__)
-
-
-def known_keys_only(saved,
-                    schema,
-                    prefix=""):
-    """
-    The keys of a saved config that the current schema still has. A run saved
-    before a key was removed (e.g. run.workdir) would otherwise not reload.
-    Returns (filtered config, dropped keys).
-    """
-    kept, dropped = {}, []
-    for key, value in saved.items():
-        if key not in schema:
-            dropped.append(prefix + key)
-        elif isinstance(value, dict) and OmegaConf.is_dict(schema[key]):
-            kept[key], inner = known_keys_only(value,
-                                               schema[key],
-                                               prefix + key + ".")
-            dropped += inner
-        else:
-            kept[key] = value
-    return kept, dropped
 
 
 def main():

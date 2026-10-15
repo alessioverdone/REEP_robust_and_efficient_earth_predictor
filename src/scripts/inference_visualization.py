@@ -5,14 +5,14 @@ Confronto visivo fra frame reali e frame predetti/ricostruiti da un modello
 gia' addestrato, su uno o piu' split.
 
     # DiT: 20 frame futuri veri vs 20 predetti, per ogni cubo
-    python src/scripts/visualize_predictions.py --type dit --model 2026-10-12_09-30-00 \
+    python src/scripts/inference_visualization.py --type dit --model 2026-10-12_09-30-00 \
         --split val iid seasonal --num-samples 5 --seed 42
 
     # Autoencoder: 10 frame di contesto veri vs 10 ricostruiti, per ogni cubo
-    python src/scripts/visualize_predictions.py --type ae --model 2026-10-10_18-02-11 \
+    python src/scripts/inference_visualization.py --type ae --model 2026-10-10_18-02-11 \
         --split train val ood --num-samples 5
 
-    python src/scripts/visualize_predictions.py --type dit --list-runs
+    python src/scripts/inference_visualization.py --type dit --list-runs
 
 Argomenti principali
 --------------------
@@ -30,8 +30,11 @@ Argomenti principali
 
 Finestre temporali
 ------------------
-    train / val / iid / ood / extreme   10 frame di contesto + 20 target (T = 30)
-    seasonal                                    20 frame di contesto + 40 target (T = 60)
+    train / val / iid / ood   10 frame di contesto + 20 target (T = 30)
+    extreme                   20 frame di contesto + 40 target (T = 60)
+    seasonal                  70 frame di contesto + 140 target (T = 210)
+Quelle degli split di test sono le finestre dei file EarthNet2021. Con extreme e seasonal
+il DiT lavora su sequenze piu' lunghe di quelle del training (T = 30): vedi with_windows.
 
 Output
 ------
@@ -71,13 +74,14 @@ from matplotlib.figure import Figure
 from safetensors.torch import load_file as load_safetensors
 from torch.utils.data import DataLoader
 
-from src.config import PathsCfg, load_config, project_path, use_project_dir, validate_config
+from src.config import (PathsCfg, load_saved_config, project_path, use_project_dir,
+                        validate_config)
 from src.dataset.dataloader_s2_dif import S2DiffusionCubeDataset, load_highres_stats
 from src.dataset.dataset_info import load_dataset_info, split_files
 from src.model.autoencoder_utils import get_vae
 from src.training.run_outputs import write_json
 
-log = logging.getLogger("visualize_predictions")
+log = logging.getLogger("inference_visualization")
 
 # --type -> sottocartella di outputs_dir con i run della fase
 FAMILY_DIRS = {"ae": "autoencoder", "dit": "diffusion"}
@@ -99,14 +103,18 @@ class SplitSpec:
     n_target: Optional[int] = None
 
 
+# Le finestre degli split di test sono quelle dei file EarthNet2021 (merge_pair si
+# ferma se un cubo ha un numero di frame diverso, invece di produrne uno sfasato):
+#   iid, ood   10 + 20 frame   (150 giorni di meteo)
+#   extreme    20 + 40 frame   (300 giorni)
+#   seasonal   70 + 140 frame  (1050 giorni)
 SPLITS: Dict[str, SplitSpec] = {
     "train": SplitSpec("train", earthnet=False),
     "val": SplitSpec("val", earthnet=False),
     "iid": SplitSpec("iid", earthnet=True, n_context=10, n_target=20),
     "ood": SplitSpec("ood", earthnet=True, n_context=10, n_target=20),
-    "extreme": SplitSpec("extreme", earthnet=True, n_context=10, n_target=20),
-    # contesto e target lunghi il doppio
-    "seasonal": SplitSpec("seasonal", earthnet=True, n_context=20, n_target=40),
+    "extreme": SplitSpec("extreme", earthnet=True, n_context=20, n_target=40),
+    "seasonal": SplitSpec("seasonal", earthnet=True, n_context=70, n_target=140),
 }
 
 
@@ -175,10 +183,12 @@ def load_run_config(run_dir: Path):
     artifacts/config.yaml del run: il config risolto all'avvio (percorso del VAE,
     scale/shift factor, checkpoint ripreso). E' quello, non un config del repo, la
     sorgente di verita' su normalizzazione, dimensioni e sampler del modello.
+    Riletto con lo schema attuale: le chiavi che i run vecchi hanno e lo schema non ha
+    piu' (es. preprocessing.test_frac) si ignorano con un avviso invece di bloccare.
     """
     path = run_dir / "artifacts" / "config.yaml"
     try:
-        return load_config(path)
+        return load_saved_config(path)
     except Exception as err:
         raise SystemExit(f"config del run non caricabile ({path}): {err}") from err
 
@@ -306,8 +316,10 @@ def with_windows(cfg, n_context: int, n_target: int):
     cfg.data.params.T = total
     cfg.data.params.noise_image_num = n_target
     temporal = cfg.diffusion.network_config.params.temporal_module_kwargs
+    # +1: la variabile statica si aggiunge come frame alla sequenza dell'attenzione
+    # temporale (Attention.forward in DiT.py), che quindi ha total + 1 posizioni
     temporal.temporal_position_encoding_max_len = max(
-        int(temporal.temporal_position_encoding_max_len), total)
+        int(temporal.temporal_position_encoding_max_len), total + 1)
     try:
         validate_config(cfg)
     except ValueError as err:
@@ -879,7 +891,7 @@ def parse_args():
                         "nome se e' unico, 'latest' o il percorso della cartella")
     p.add_argument("--split", type=split_arg, nargs="+", metavar="SPLIT",
                    help=f"uno o piu' fra: {', '.join(SPLITS)} (anche iid_test_split, ...). "
-                        f"seasonal usa 20 frame di contesto e 40 di target")
+                        f"extreme usa 20 frame di contesto e 40 di target, seasonal 70 e 140")
     p.add_argument("--checkpoint", type=str, default="best",
                    help="dit: 'best' (checkpoints/best), 'latest' (checkpoint-<step> piu' alto) "
                         "o il nome di una sottocartella di checkpoints/. "

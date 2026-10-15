@@ -58,12 +58,14 @@ highresstatic
 
 Split
 -----
-Nothing is selected or split here. The cubes of each split (train / val /
-test, by location) are listed in dataset.json, written by preprocessing.py
-after dropping the cubes with entirely missing images: they are the same
-cubes the autoencoder was trained, validated and tested on (see
-src/dataset/dataset_info.py). With max_bad_frames the cubes with too many
-rejected frames can also be excluded (see keep_map in stats.json).
+Nothing is selected or split here. The cubes of each split (train / val, by
+location) are listed in dataset.json, written by preprocessing.py after
+dropping the cubes with entirely missing images: they are the same cubes the
+autoencoder was trained and validated on (see src/dataset/dataset_info.py).
+The final evaluation does not use them: it runs on the EarthNet test splits
+(iid, ood, extreme, seasonal), see src/scripts/evaluate_ens.py. With
+max_bad_frames the cubes with too many rejected frames can also be excluded
+(see keep_map in stats.json).
 
 Normalizzazione delle condizioni
 --------------------------------

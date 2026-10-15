@@ -1050,6 +1050,65 @@ def log_videos_local_and_wandb(
     return validate_log, batch_sums, forecast
 
 
+def validation_loss(loss_fn,
+                    model,
+                    denoiser,
+                    conditioner,
+                    first_stage_model,
+                    batch,
+                    config_diffusion,
+                    noise_image_num,
+                    weight_dtype,
+                    valid_mask=None,
+                    seed=0):
+    """
+    The training loss on a validation batch (no gradient, eval mode): what
+    diffusion.save_best_by=loss compares across epochs. Returns its mean over the cubes.
+
+    The training loss is stochastic: every call draws a sigma per cube and a noise, and
+    the conditioner randomly drops the conditions (ucg_rate, for classifier-free
+    guidance). On the same weights and batch that makes the number vary a lot (with the
+    heavy-tailed min-SNR weights, from 25% to several times its value between two
+    calls), so the "best" epoch would be a lottery. Here the draws come from a generator
+    seeded with `seed` (the caller passes the same one for the same batch at every
+    validation, so the weights are compared on the same sigmas and noises) and restored
+    afterwards, leaving the RNG of the training untouched, and the condition dropout is off.
+    """
+    x = batch[config_diffusion.input_key]
+    device = x.device
+    cuda_devices = ([device.index if device.index is not None else torch.cuda.current_device()]
+                    if device.type == "cuda" else [])
+    embedders = list(getattr(conditioner, "module", conditioner).embedders)
+    ucg_rates = [embedder.ucg_rate for embedder in embedders]
+
+    model.eval()
+    conditioner.eval()
+    try:
+        for embedder in embedders:
+            embedder.ucg_rate = 0.0
+        with torch.no_grad(), torch.random.fork_rng(devices=cuda_devices):
+            torch.manual_seed(seed)
+            B, T, C, H, W = x.shape
+            x_future = x[:, -noise_image_num:, ...]
+            x_past_mean = encode_first_stage(
+                torch.mean(x[:, :-noise_image_num, ...], dim=1).contiguous(),
+                first_stage_model, config_diffusion).to(dtype=weight_dtype)
+            z = encode_first_stage(x.view(B * T, C, H, W).contiguous(),
+                                   first_stage_model, config_diffusion).to(dtype=weight_dtype)
+            z = z.view(B, T, *z.shape[1:]).contiguous()
+            loss = loss_fn(model, denoiser, conditioner, z, batch, x_future, x_past_mean,
+                           functools.partial(decode_first_stage,
+                                             first_stage_model=first_stage_model,
+                                             config_diffusion=config_diffusion),
+                           valid_mask=valid_mask)[0]
+    finally:
+        for embedder, rate in zip(embedders, ucg_rates):
+            embedder.ucg_rate = rate
+        model.train()
+        conditioner.train()
+    return float(loss.float().mean())
+
+
 def _fmt_ens(value):
     """An ENS statistic for the log: 6 decimals, or n/a when the cubes gave none."""
     return "n/a" if value is None else f"{value:.6f}"
@@ -1678,7 +1737,8 @@ def training_info(cfg,
                            "max_batches": acc.validate_batch_num},
         },
         "metrics": {
-            "selection_criterion": f"val_{cfg.diffusion.save_best_by}",
+            "selection_criterion": {"rmse": "val_latter_rmse", "loss": "val_loss",
+                                    "ens": "val_ENS"}[cfg.diffusion.save_best_by],
             "train_last": state.train_metrics,
             "val_last": {"epoch": state.val_epoch,
                          "n_cubes": metrics.n_cubes if state.val_metrics else None,
@@ -2166,30 +2226,16 @@ def train_loop(cfg,
                     ens_eval.add_batch(ens_val_rows, forecast["pred_samples"],
                                        forecast["target"], cloud, batch.get("cube_path"))
                 if val_loss_totals is not None:
-                    # the training loss on the validation batch, no gradient, eval mode
-                    # (log_videos_local_and_wandb leaves the model in train mode)
-                    model.eval()
-                    conditioner.eval()
-                    with torch.no_grad():
-                        x = batch[config_diffusion.input_key]
-                        vB, vT, vC, vH, vW = x.shape
-                        x_future = x[:, -noise_image_num:, ...]
-                        x_past_mean = encode_first_stage(
-                            torch.mean(x[:, :-noise_image_num, ...], dim=1).contiguous(),
-                            first_stage_model, config_diffusion).to(dtype=weight_dtype)
-                        x = encode_first_stage(x.view(vB * vT, vC, vH, vW).contiguous(),
-                                               first_stage_model, config_diffusion
-                                               ).to(dtype=weight_dtype)
-                        x = x.view(vB, vT, *x.shape[1:]).contiguous()
-                        val_loss = loss_fn(model, denoiser, conditioner, x, batch, x_future,
-                                           x_past_mean,
-                                           functools.partial(decode_first_stage,
-                                                             first_stage_model=first_stage_model,
-                                                             config_diffusion=config_diffusion),
-                                           valid_mask=cloud if loss_on_valid else None)[0]
-                    model.train()
-                    conditioner.train()
-                    val_loss_totals[0] += float(val_loss.float().mean()) * vB
+                    # the training loss on the validation batch, with fixed random draws
+                    # (the seed depends on the batch only, so every validation uses the same
+                    # sigmas and noises) and no condition dropout, see validation_loss
+                    vB = batch[config_diffusion.input_key].shape[0]
+                    val_loss = validation_loss(loss_fn, model, denoiser, conditioner,
+                                               first_stage_model, batch, config_diffusion,
+                                               noise_image_num, weight_dtype,
+                                               valid_mask=cloud if loss_on_valid else None,
+                                               seed=args.seed + batch_num)
+                    val_loss_totals[0] += val_loss * vB
                     val_loss_totals[1] += vB
                 val_totals += batch_sums
                 lead_totals[0] += forecast["lead_se"]

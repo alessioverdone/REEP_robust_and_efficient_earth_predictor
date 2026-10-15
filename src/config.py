@@ -277,7 +277,7 @@ class TemporalModuleCfg:
     num_attention_heads: int = 4
     attention_block_types: list[str] = field(default_factory=lambda: ["Temporal_Self"])
     temporal_position_encoding: bool = True
-    temporal_position_encoding_max_len: int = 40        # deve essere >= image_time_length
+    temporal_position_encoding_max_len: int = 40        # deve essere >= image_time_length + 1 (frame statico)
     temporal_attention_dim_div: int = 1
     zero_initialize: bool = True
     gradient_checkpoint: bool = True
@@ -580,7 +580,9 @@ class DiffusionCfg:
     # Which validation epoch is saved as checkpoints/best:
     #   "rmse": lowest latter_rmse (RMSE on the last 10 of the 20 predicted frames)
     #   "loss": lowest diffusion loss on the validation set (one extra forward pass per
-    #           validation batch, same loss as in training, noise sampled at random)
+    #           validation batch: the training loss, but with the same sigmas and noises at
+    #           every validation and without condition dropout, so that two epochs are
+    #           compared on the same draws; see validation_loss)
     #   "ens":  highest ENS on the validation set (needs ens.enabled and ens.validation)
     save_best_by: str = "rmse"
     SAVE_BEST_BY: ClassVar[tuple[str, ...]] = ("rmse", "loss", "ens")
@@ -731,8 +733,8 @@ class AccelerateCfg:
     logging_steps: int = 500
 
     # Validazione ogni 10 epoche, sull'INTERO validation set (183 batch da 8 cubi):
-    # le quattro RMSE aggregate finiscono in logs/validation_metrics.log e il
-    # modello con il latter_rmse piu' basso in checkpoints/best-latter_rmse.
+    # le RMSE aggregate finiscono in history.csv e l'epoca scelta da diffusion.save_best_by
+    # (default: il latter_rmse piu' basso) in checkpoints/best.
     # L'ultima epoca viene sempre validata a prescindere dall'intervallo, cosi'
     # lo stato finale ha una misura e puo' aggiornare il best.
     # (portato a 5 per la coda di diffusion_v1, poi rimesso a 10)
@@ -847,23 +849,65 @@ def _set_first_stage_schema(cfg: DictConfig, fs_type: Optional[str]) -> None:
     cfg.diffusion.first_stage_config = FIRST_STAGE_SCHEMAS[fs_type]()
 
 
-def load_config(*paths: Union[str, Path], overrides: Optional[list[str]] = None) -> TrainCfg:
+def known_keys_only(saved: dict, schema: Any, prefix: str = "") -> tuple[dict, list[str]]:
+    """
+    The keys of a saved config that `schema` (a DictConfig) still has. A run saved
+    before a key was removed (e.g. run.workdir, preprocessing.test_frac) would otherwise
+    not reload. Returns (filtered config, dropped keys).
+    """
+    kept, dropped = {}, []
+    for key, value in saved.items():
+        if key not in schema:
+            dropped.append(prefix + key)
+        elif isinstance(value, dict) and OmegaConf.is_dict(schema[key]):
+            kept[key], inner = known_keys_only(value, schema[key], prefix + key + ".")
+            dropped += inner
+        else:
+            kept[key] = value
+    return kept, dropped
+
+
+def load_config(*paths: Union[str, Path], overrides: Optional[list[str]] = None,
+                drop_unknown: bool = False) -> TrainCfg:
     """
     Schema TrainCfg <- yaml in `paths` (da sinistra a destra) <- `overrides` in
     dotlist (es. ["diffusion.scale_factor=0.2"]), poi validate_config().
+
+    drop_unknown=True ignora (con un avviso) le chiavi dei yaml che lo schema non ha
+    piu': serve per rileggere il config salvato da un run vecchio (vedi
+    load_saved_config). Per i config che si scrivono a mano resta False: li' una chiave
+    sconosciuta e' quasi sempre un refuso, e deve fermare il lancio.
     """
     sources = [OmegaConf.load(p) for p in paths]
-    if overrides:
-        sources.append(OmegaConf.from_dotlist(list(overrides)))
+    override_sources = [OmegaConf.from_dotlist(list(overrides))] if overrides else []
 
     cfg = OmegaConf.structured(TrainCfg)
     # la variante del first stage va scelta PRIMA del merge (vince l'ultima sorgente)
-    for src in sources:
+    for src in sources + override_sources:
         _set_first_stage_schema(cfg, OmegaConf.select(src, _FIRST_STAGE_TYPE_KEY))
-    cfg = OmegaConf.merge(cfg, *sources)
+    if drop_unknown:
+        # solo i file: gli override sono scritti a mano, un refuso li' deve fallire
+        filtered = []
+        for path, src in zip(paths, sources):
+            kept, dropped = known_keys_only(OmegaConf.to_container(src), cfg)
+            if dropped:
+                print(f"[config] {path}: chiavi non piu' nello schema, ignorate: {dropped}")
+            filtered.append(OmegaConf.create(kept))
+        sources = filtered
+    cfg = OmegaConf.merge(cfg, *sources, *override_sources)
 
     validate_config(cfg)
     return cfg  # type: ignore[return-value]
+
+
+def load_saved_config(path: Union[str, Path]) -> TrainCfg:
+    """
+    artifacts/config.yaml di un run, riletto con lo schema ATTUALE. Un run salvato prima
+    che una chiave venisse tolta (preprocessing.test_frac e autoencoder.test_npy sono
+    spariti con lo split di test del preprocessing) non si caricherebbe nello schema
+    tipizzato: quelle chiavi si ignorano con un avviso, il resto resta com'e' stato salvato.
+    """
+    return load_config(path, drop_unknown=True)
 
 
 def _merge_into(cfg: TrainCfg, source: DictConfig) -> TrainCfg:
@@ -1253,8 +1297,10 @@ def validate_config(cfg: TrainCfg) -> None:
         errors.append(f"input_size={dit.input_size} del DiT non divisibile per "
                       f"patch_size={dit.patch_size}")
     max_len = dit.temporal_module_kwargs.temporal_position_encoding_max_len
-    if dit.image_time_length > max_len:
-        errors.append(f"image_time_length={dit.image_time_length} supera "
+    # la variabile statica si aggiunge come frame alla sequenza dell'attenzione temporale
+    # (Attention.forward in DiT.py): servono image_time_length + 1 posizioni
+    if dit.image_time_length + 1 > max_len:
+        errors.append(f"image_time_length={dit.image_time_length} + 1 (il frame statico) supera "
                       f"temporal_position_encoding_max_len={max_len}")
     if data.meso_time_span != "all":
         errors.append("data.params.meso_time_span deve essere 'all': climate_var del DiT "

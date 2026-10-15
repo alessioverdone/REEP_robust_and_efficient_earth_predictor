@@ -243,8 +243,10 @@ class StandardDiffusionLoss(nn.Module):
         if mask is None:
             theta = torch.mean(theta)
         else:
-            m = rearrange(mask, "b t c h w -> (b t h w c)").to(theta.dtype)
-            theta = torch.sum(theta * m) / (torch.sum(m) + 1e-8)
+            # in float32: the sum of the weights runs up to b*t*h*w (~1e4 cells) and in bf16
+            # (8 bits of mantissa) it would be rounded by up to ~0.4%
+            m = rearrange(mask, "b t c h w -> (b t h w c)").float()
+            theta = torch.sum(theta.float() * m) / (torch.sum(m) + 1e-8)
         
         return theta
 

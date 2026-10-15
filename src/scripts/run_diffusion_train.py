@@ -14,7 +14,7 @@ from src.config import config_from_cli
 from src.model.diffusion_utils import (configure_train, describe_run, instantiate_models,
                                        mark_run_ended, prepare_training, setup_dataloader,
                                        train_loop)
-from src.training.ens_eval import evaluate_test_splits, release_gpu_memory
+from src.training.ens_eval import check_ens_dependencies, evaluate_test_splits, release_gpu_memory
 from src.training.run_outputs import create_shared_run_outputs
 from src.training.runtime import setup_runtime
 from src.training.tracking import start_tracker
@@ -37,6 +37,17 @@ def main(config_file=DEFAULT_CONFIG_FILE,
                                         "forecasts")
     rt = setup_runtime(cfg,                              # accelerator, dtype, seed, tf32, log in artifacts/train.log
                        outputs)
+
+    # The ENS (in the loop, and in the test evaluation at the end) needs earthnet and
+    # scikit-image. With ens.enabled a missing one stops the run now; with only test_eval
+    # it is a warning (the training does not need them, the evaluation would just fail).
+    if cfg.ens.enabled:
+        check_ens_dependencies()
+    elif cfg.test_eval.enabled:
+        try:
+            check_ens_dependencies()
+        except ImportError as error:
+            logger.warning(f"[test_eval] it will fail at the end of the training: {error}")
 
     # Get model
     model, conditioner, first_stage_model, first_stage_info = instantiate_models(cfg,
@@ -91,7 +102,9 @@ def main(config_file=DEFAULT_CONFIG_FILE,
                                "diffusion",
                                rt.accelerator.is_main_process)
 
-    # Training Loop
+    # Training Loop, then the test-set evaluation. Both are inside the try, so that an
+    # interruption (e.g. Ctrl+C during the evaluation, which can take hours) closes
+    # training_info.json as "interrupted" instead of leaving it on "running".
     try:
         train_loop(cfg,
                    rt,
@@ -107,6 +120,18 @@ def main(config_file=DEFAULT_CONFIG_FILE,
                    train_dataloader,
                    val_dataloader,
                    loss_fn)
+
+        # Test-set evaluation (config section test_eval): evaluate_ens.py on iid / ood /
+        # extreme / seasonal, reloading the checkpoint from disk. The training objects are
+        # dropped first (the scheduler still refers to the optimizer, so the parameters
+        # of the DiT stay on the GPU next to the copy the evaluation loads: a few hundred
+        # MB for a DiT-B). A failure of the evaluation itself is logged and does not fail
+        # the run (see evaluate_test_splits).
+        if cfg.test_eval.enabled:
+            del (model, conditioner, first_stage_model, optimizer, denoiser, sampler,
+                 loss_fn, train_dataloader, val_dataloader)
+            release_gpu_memory(rt.accelerator)
+            evaluate_test_splits(cfg, rt, outputs, state)
     except BaseException as error:
         mark_run_ended(cfg,
                        rt,
@@ -115,15 +140,6 @@ def main(config_file=DEFAULT_CONFIG_FILE,
                        lr_scheduler,
                        error=error)
         raise
-
-    # Test-set evaluation (config section test_eval): evaluate_ens.py on iid / ood /
-    # extreme / seasonal, reloading the checkpoint from disk. The training objects are
-    # dropped first so the GPU holds one copy of the model, not two.
-    if cfg.test_eval.enabled:
-        del (model, conditioner, first_stage_model, optimizer, denoiser, sampler,
-             loss_fn, train_dataloader, val_dataloader)
-        release_gpu_memory(rt.accelerator)
-        evaluate_test_splits(cfg, rt, outputs, state)
     mark_run_ended(cfg,
                    rt,
                    outputs,
