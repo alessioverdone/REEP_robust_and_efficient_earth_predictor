@@ -570,6 +570,13 @@ class DiffusionCfg:
     channel_scale_factors: Optional[list[float]] = None
 
     disable_first_stage_autocast: bool = True
+    # Which validation epoch is saved as checkpoints/best:
+    #   "rmse": lowest latter_rmse (RMSE on the last 10 of the 20 predicted frames)
+    #   "loss": lowest diffusion loss on the validation set (one extra forward pass per
+    #           validation batch, same loss as in training, noise sampled at random)
+    #   "ens":  highest ENS on the validation set (needs ens.enabled and ens.validation)
+    save_best_by: str = "rmse"
+    SAVE_BEST_BY: ClassVar[tuple[str, ...]] = ("rmse", "loss", "ens")
     # pretrained_image_ckpt (non usato): checkpoints/sd_xl_base_1.0.safetensors
     # oppure checkpoints/768-v-ema.safetensors
     input_key: str = "imgs"
@@ -1101,6 +1108,7 @@ def validate_config(cfg: TrainCfg) -> None:
         "diffusion.denoiser_config.params.weighting_config.params.mode": ("min", "max"),
         _FIRST_STAGE_TYPE_KEY: tuple(FIRST_STAGE_SCHEMAS),
         "autoencoder.save_best_by": ("loss", "mse", "psnr", "ssim"),
+        "diffusion.save_best_by": DiffusionCfg.SAVE_BEST_BY,
         "data.params.meso_agg": ("last", "first", "mean", "sum"),
         "data.params.meso_time_span": ("all", "future"),
     }
@@ -1198,6 +1206,8 @@ def validate_config(cfg: TrainCfg) -> None:
     if ens.enabled and not (ens.validation or ens.train):
         errors.append("ens.enabled=true but ens.validation and ens.train are both false: "
                       "nothing would be computed")
+    if cfg.diffusion.save_best_by == "ens" and not (ens.enabled and ens.validation):
+        errors.append("diffusion.save_best_by=ens needs ens.enabled=true and ens.validation=true")
     if ens.train and (ens.train_cubes < 1 or ens.train_every_epochs < 1):
         errors.append("ens.train_cubes and ens.train_every_epochs must be >= 1")
     if ens.enabled and cfg.run.val_num_samples < 1:

@@ -116,8 +116,9 @@ class TrainState:
     first_epoch: int = 0
     # batch gia' consumati nell'epoca da cui si riprende, saltati una volta sola
     resume_step: int = 0
-    # minimo storico del criterio di selezione del modello migliore
-    best_latter_rmse: float = float("inf")
+    # miglior valore storico del criterio di selezione (diffusion.save_best_by), in forma
+    # "piu' basso e' meglio": latter_rmse, loss, oppure -ENS
+    best_value: float = float("inf")
 
     best_ckpt_path: str = ""
     history_csv: str = ""

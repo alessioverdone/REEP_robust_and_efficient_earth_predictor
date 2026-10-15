@@ -1351,7 +1351,8 @@ def resolve_resume_checkpoint(cfg,
 
 
 def _inherit_history(state,
-                     resume_from):
+                     resume_from,
+                     save_best_by="rmse"):
     """
     When resuming from a checkpoint of an earlier run, copy that run's
     history.csv and lead_time.csv rows up to the resumed epoch, so the curves
@@ -1381,18 +1382,27 @@ def _inherit_history(state,
     if int(best.get("global_step", 0)) > state.global_step:
         # saved after the resumed checkpoint: not part of this run's history
         return
-    state.best_latter_rmse = float(best["latter_rmse"])
+    criterion = best.get("criterion", "rmse")      # runs older than save_best_by used latter_rmse
+    if criterion != save_best_by:
+        logger.warning(f"best of {best_metric_file} was chosen by {criterion!r}, this run uses "
+                       f"{save_best_by!r}: its best is not inherited")
+        return
+    if "criterion_value" in best:
+        state.best_value = float(best["criterion_value"])
+    else:
+        state.best_value = float(best["latter_rmse"])
     state.best_epoch = best.get("epoch")
     state.best_global_step = best.get("global_step")
     state.best_val_metrics = {k: v for k, v in best.items()
-                              if k not in ("epoch", "global_step", "n_cubes", "k")}
+                              if k not in ("epoch", "global_step", "n_cubes", "k",
+                                           "criterion", "criterion_value")}
     state.checkpoints["best"] = {"folder": relative_to_project(os.path.dirname(best_metric_file)),
                                  "inherited": True,
                                  "epoch": state.best_epoch,
                                  "global_step": state.best_global_step,
-                                 "latter_rmse": state.best_latter_rmse}
-    logger.info(f"latter_rmse migliore ripreso da {best_metric_file}: "
-                f"{state.best_latter_rmse:.6f} (epoca {state.best_epoch})")
+                                 "criterion": save_best_by}
+    logger.info(f"best ({save_best_by}) ripreso da {best_metric_file}: "
+                f"{abs(state.best_value):.6f} (epoca {state.best_epoch})")
 
 
 def _load_weights_only(accelerator,
@@ -1492,7 +1502,8 @@ def configure_train(cfg,
         state.epochs_completed = state.first_epoch
         if accelerator.is_main_process:
             _inherit_history(state,
-                             resume_from)
+                             resume_from,
+                             cfg.diffusion.save_best_by)
 
     # Config of the run, saved after everything resolved at start-up (VAE path,
     # scale_factor, checkpoint to resume from), so it says what actually ran.
@@ -1663,7 +1674,7 @@ def training_info(cfg,
                            "max_batches": acc.validate_batch_num},
         },
         "metrics": {
-            "selection_criterion": "val_latter_rmse",
+            "selection_criterion": f"val_{cfg.diffusion.save_best_by}",
             "train_last": state.train_metrics,
             "val_last": {"epoch": state.val_epoch,
                          "n_cubes": metrics.n_cubes if state.val_metrics else None,
@@ -1843,7 +1854,7 @@ def train_loop(cfg,
                loss_fn):
     """
     Il training vero e proprio. `state` (TrainState) arriva da configure_train()
-    e viene fatto avanzare qui: global_step, resume_step, best_latter_rmse e le
+    e viene fatto avanzare qui: global_step, resume_step, best_value e le
     metriche in state.metrics cambiano mentre il loop gira, quindi si leggono e
     si scrivono sempre sull'oggetto, non su copie locali.
     After every epoch: history.csv, curves, training_info.json; at every
@@ -1859,6 +1870,10 @@ def train_loop(cfg,
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / config_accelerate.gradient_accumulation_steps)
     # the columns of the validation metrics, also on the epochs without one
     val_keys = list(validation_rmse([0.0] * len(VAL_SUM_KEYS)))
+    # which validation epoch becomes checkpoints/best (config diffusion.save_best_by)
+    save_best_by = cfg.diffusion.save_best_by
+    if save_best_by == "loss":
+        val_keys.append("loss")             # val_loss column in history.csv
 
     # ENS (config section `ens`): scoring of the forecasts, shared with evaluate_ens.py.
     # ens_columns = the columns it adds to history.csv, empty (they stay empty on the
@@ -2082,6 +2097,9 @@ def train_loop(cfg,
             lead_totals = torch.zeros(3, noise_image_num, device=accelerator.device,
                                       dtype=torch.float64)
             n_val_batches = 0
+            # diffusion.save_best_by=loss: sum of the loss * cubes, and the cubes
+            val_loss_totals = (torch.zeros(2, device=accelerator.device, dtype=torch.float64)
+                               if save_best_by == "loss" else None)
             # ENS: one row per cube, filled batch by batch with the forecasts the RMSEs
             # already need (no second inference)
             ens_val_rows = [] if (ens_eval is not None and ens_cfg.validation) else None
@@ -2136,6 +2154,31 @@ def train_loop(cfg,
                 if ens_val_rows is not None:
                     ens_eval.add_batch(ens_val_rows, forecast["pred_samples"],
                                        forecast["target"], cloud, batch.get("cube_path"))
+                if val_loss_totals is not None:
+                    # the training loss on the validation batch, no gradient, eval mode
+                    # (log_videos_local_and_wandb leaves the model in train mode)
+                    model.eval()
+                    conditioner.eval()
+                    with torch.no_grad():
+                        x = batch[config_diffusion.input_key]
+                        vB, vT, vC, vH, vW = x.shape
+                        x_future = x[:, -noise_image_num:, ...]
+                        x_past_mean = encode_first_stage(
+                            torch.mean(x[:, :-noise_image_num, ...], dim=1).contiguous(),
+                            first_stage_model, config_diffusion).to(dtype=weight_dtype)
+                        x = encode_first_stage(x.view(vB * vT, vC, vH, vW).contiguous(),
+                                               first_stage_model, config_diffusion
+                                               ).to(dtype=weight_dtype)
+                        x = x.view(vB, vT, *x.shape[1:]).contiguous()
+                        val_loss = loss_fn(model, denoiser, conditioner, x, batch, x_future,
+                                           x_past_mean,
+                                           functools.partial(decode_first_stage,
+                                                             first_stage_model=first_stage_model,
+                                                             config_diffusion=config_diffusion))[0]
+                    model.train()
+                    conditioner.train()
+                    val_loss_totals[0] += float(val_loss.float().mean()) * vB
+                    val_loss_totals[1] += vB
                 val_totals += batch_sums
                 lead_totals[0] += forecast["lead_se"]
                 lead_totals[1] += forecast["lead_baseline_se"]
@@ -2173,6 +2216,9 @@ def train_loop(cfg,
             val_totals = accelerator.gather(val_totals.unsqueeze(0)).sum(dim=0)
             lead_totals = accelerator.gather(lead_totals.unsqueeze(0)).sum(dim=0)
             val_rmse = validation_rmse(val_totals)
+            if val_loss_totals is not None:
+                val_loss_totals = accelerator.gather(val_loss_totals.unsqueeze(0)).sum(dim=0)
+                val_rmse["loss"] = float(val_loss_totals[0] / val_loss_totals[1].clamp(min=1))
             n_cubes = int(val_totals[VAL_SUM_KEYS.index("n_cubes")])
             lead_rmse = torch.sqrt(lead_totals[:2] / lead_totals[2].clamp(min=1)).tolist()
             if ens_val_rows is not None:
@@ -2214,18 +2260,33 @@ def train_loop(cfg,
                     })
 
             # --- salvataggio del modello migliore ---------------------------
-            # Il criterio e' latter_rmse: l'errore sugli ultimi 10 dei 20 frame
-            # predetti, cioe' la parte piu' lontana dal contesto e quella che
-            # separa davvero un modello che estrapola da uno che copia l'ultimo
-            # frame visto.
+            # Il criterio e' diffusion.save_best_by:
+            #   rmse: latter_rmse, l'errore sugli ultimi 10 dei 20 frame predetti,
+            #         cioe' la parte piu' lontana dal contesto e quella che separa
+            #         davvero un modello che estrapola da uno che copia l'ultimo
+            #         frame visto
+            #   loss: la loss di diffusione sul validation set
+            #   ens:  l'ENS sul validation set (piu' alto = meglio)
+            # current_value e' in forma "piu' basso e' meglio" (-ENS per l'ENS).
             # In --validate_only non si salva niente: i pesi sono quelli del
             # checkpoint appena caricato.
-            if (not args.validate_only) and val_rmse["latter_rmse"] < state.best_latter_rmse:
-                previous = state.best_latter_rmse
-                state.best_latter_rmse = val_rmse["latter_rmse"]
+            if save_best_by == "rmse":
+                current_value = val_rmse["latter_rmse"]
+            elif save_best_by == "loss":
+                current_value = val_rmse["loss"]
+            else:
+                ens_value = ens_row.get("val_ENS")
+                current_value = -ens_value if ens_value is not None else float("nan")
+            shown = abs(current_value)
+            criterion_name = {"rmse": "latter_rmse", "loss": "loss", "ens": "ENS"}[save_best_by]
+            if (not args.validate_only) and current_value < state.best_value:
+                previous = abs(state.best_value)
+                state.best_value = current_value
                 state.best_epoch = epoch + 1
                 state.best_global_step = state.global_step
                 state.best_val_metrics = dict(val_rmse)
+                if ens_row.get("val_ENS") is not None:
+                    state.best_val_metrics["ENS"] = ens_row["val_ENS"]
                 state.best_val_lead_time = dict(state.val_lead_time)
                 if accelerator.is_main_process:
                     accelerator.save_state(state.best_ckpt_path)
@@ -2233,21 +2294,23 @@ def train_loop(cfg,
                               "w", encoding="utf-8") as fh:
                         json.dump({"epoch": epoch + 1, "global_step": state.global_step,
                                    "n_cubes": n_cubes, "k": args.val_num_samples,
-                                   **val_rmse}, fh, indent=2)
+                                   "criterion": save_best_by, "criterion_value": current_value,
+                                   **state.best_val_metrics}, fh, indent=2)
                     state.checkpoints["best"] = {"folder": "best",
                                                  "epoch": epoch + 1,
                                                  "global_step": state.global_step,
-                                                 "latter_rmse": state.best_latter_rmse}
+                                                 "criterion": save_best_by,
+                                                 criterion_name: shown}
                     logger.info(
-                        f"[validation] nuovo minimo di latter_rmse: "
-                        f"{state.best_latter_rmse:.6f} (prima {previous:.6f}), "
+                        f"[validation] nuovo migliore per {criterion_name}: "
+                        f"{shown:.6f} (prima {previous:.6f}), "
                         f"stato salvato in {state.best_ckpt_path}"
                     )
                 accelerator.wait_for_everyone()
             elif not args.validate_only:
                 logger.info(
-                    f"[validation] latter_rmse {val_rmse['latter_rmse']:.6f} non "
-                    f"migliora il minimo {state.best_latter_rmse:.6f}, niente da salvare"
+                    f"[validation] {criterion_name} {shown:.6f} non "
+                    f"migliora il migliore {abs(state.best_value):.6f}, niente da salvare"
                 )
 
         # --- ENS on a sample of training cubes -------------------------------------
