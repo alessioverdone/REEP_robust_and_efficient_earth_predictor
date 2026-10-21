@@ -8,6 +8,9 @@ Fase 2: addestramento del diffusion model
 Every run writes into registry/outputs/diffusion/<start timestamp>/, see
 src/training/run_outputs.py.
 """
+import sys
+from pathlib import Path
+
 from accelerate.logging import get_logger
 
 from src.config import config_from_cli
@@ -28,8 +31,19 @@ DEFAULT_CONFIG_FILE = "configuration_0.yaml"
 DEFAULT_PROJECT_NAME = "diffusion_debug"
 
 
+def add_sgm_to_path():
+    # The diffusion config instantiates its modules from strings like
+    # "sgm.modules...", importable only with src/model on the path: the
+    # equivalent of `export PYTHONPATH=src/model`, without the shell.
+    model_dir = str(Path(__file__).resolve().parents[1] / "model")
+    if model_dir not in sys.path:
+        sys.path.insert(0, model_dir)
+
+
 def main(config_file=DEFAULT_CONFIG_FILE,
          project_name=DEFAULT_PROJECT_NAME):
+    add_sgm_to_path()
+
     # Configuration
     cfg = config_from_cli(config_file=config_file,       # schema di src/config.py <- yaml di --cfgdir <- flag <- --set, validato
                           project_name=project_name)
