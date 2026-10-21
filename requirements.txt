@@ -69,6 +69,7 @@ imageio
 matplotlib
 tqdm
 wandb                     # tracker di accelerate (per ora offline e commentato)
+optuna>=4                 # src/training/sweep.py (hyperparameter search)
 
 # ---- Dataset EarthNet ----
 # Serve solo a src/dataset/ (download ed esplorazione dei minicubi): per il

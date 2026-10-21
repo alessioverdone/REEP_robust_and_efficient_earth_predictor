@@ -255,6 +255,7 @@ registry/
   checkpoints/             checkpoints promoted by hand (the ones in regular use)
   outputs/autoencoder/     one folder per phase-1 run (see step 3)
   outputs/diffusion/       one folder per phase-2 run (see step 4)
+  outputs/sweeps/<name>/   one folder per hyperparameter search (see below)
 
 src/
   config.py                schema tipizzato + riga di comando. Punto di partenza
@@ -270,11 +271,13 @@ src/
     state.py               TrainState / TrainMetrics: progresso e misure del run
     run_outputs.py         the run folder under registry/outputs/ and its files
     tracking.py            live report on Weights & Biases (wandb section)
+    sweep.py               hyperparameter search with Optuna over the run scripts
     train_autoencoder.py   fase 1: dati, modello, loop
   scripts/
     run_autoencoder_train.py   punto d'ingresso fase 1
     run_diffusion_train.py     punto d'ingresso fase 2
     measure_latent_stats.py    adds the per-channel latent stats to an older VAE run
+    run_sweep.py               entry point of a hyperparameter search
 
 other/                     legacy code and references, not maintained (old trainer,
                            MAE first stage, old configs, old requirements)
@@ -313,6 +316,85 @@ python src/scripts/run_autoencoder_train.py --project_name vae_32 --set wandb.en
 
 Keys: `project`, `entity`, `mode` (online | offline), `tags`, `upload_files`,
 `log_images`.
+
+## Hyperparameter search (Optuna)
+
+```bash
+python src/scripts/run_sweep.py --sweep sweep_diffusion_0.yaml
+```
+
+A sweep is a yaml in `registry/configurations/` (schema `SweepCfg` in
+`src/training/sweep.py`). Each trial is one ordinary run of the phase script,
+launched as a subprocess with `--set` overrides, so the training code is not
+aware of the sweep. Trials run one at a time.
+
+| file | what it searches |
+|---|---|
+| `sweep_diffusion_0.yaml` | phase 2, trains every trial: lr, warmup, DiT depth / hidden_size / heads, MinSNR gamma, past_weight |
+| `sweep_autoencoder_0.yaml` | phase 1: lr, weight decay, batch size, block_out_channels, layers_per_block |
+| `sweep_sampling_0.yaml` | phase 2, `mode: validate_only`: sampler steps and CFG scale on a trained `checkpoint`, no training |
+
+The keys of a sweep:
+
+| key | meaning |
+|---|---|
+| `name` | the study and its folder `registry/outputs/sweeps/<name>/` |
+| `phase`, `mode` | `autoencoder` / `diffusion`; `train`, or `validate_only` (diffusion, with `checkpoint`) |
+| `base_config` | the run config(s), as `--cfgdir` |
+| `fixed` | dotlist overrides applied to every trial (e.g. fewer epochs) |
+| `params` | the search space: `{type: float\|int, low, high, step?, log?}` or `{type: categorical, choices: [...]}`; `choices: {name: value}` for list values such as `block_out_channels` |
+| `metric`, `direction` | a `val_` column of `history.csv`, minimize / maximize |
+| `n_trials` | total of the study, earlier launches included |
+| `sampler` | `tpe` (default, `n_startup_trials` random trials first, `multivariate`) or `random`; `seed` |
+| `pruning` | `MedianPruner`: `n_startup_trials`, `n_warmup_steps` (epochs), `interval_steps` |
+| `launcher` | null = `python` (phase 1) / `python -m accelerate.commands.launch` (phase 2) |
+| `poll_seconds`, `stop_timeout_seconds` | how often `history.csv` is read; how long to wait after SIGINT |
+
+How it works:
+- **Metric.** The value of a trial is the best `metric` over the rows of its
+  `history.csv` (the epoch of `checkpoints/best`). In `validate_only` it is the
+  value of the single validation.
+- **Pruning.** While a trial runs, its new `history.csv` rows are reported to
+  Optuna, at step = epoch. When the pruner stops a trial, the sweep sends
+  SIGINT to the trial: its run folder says `interrupted`, Optuna says `PRUNED`.
+  In phase 2 rows exist only at validations, so `validate_epoch_interval` sets
+  how often trials are compared.
+- **Resume.** Rerunning the same yaml resumes the study (`study.db`) and runs
+  only the missing trials. Only `n_trials`, `launcher`, `poll_seconds` and
+  `stop_timeout_seconds` may change; any other change is refused, so give a new
+  search space a new `name`. Trials stopped by Ctrl-C, or left behind by a
+  sweep that was killed, do not count toward `n_trials` and are run again.
+- **Failures.** A trial whose config is invalid, or whose run crashes, is
+  recorded as `FAIL` with its reason, and the sweep goes on.
+- **VAE.** A diffusion sweep resolves `pretrained_path: latest` once, when the
+  study is created, and every trial uses that VAE. Trial folders live under
+  `outputs/sweeps/`, so `latest` never picks a trial run. To use an
+  autoencoder trial in phase 2, pass its `checkpoints/best.pt` as
+  `pretrained_path`.
+- **Not searchable.** `preprocessing.*` (the dataset must already exist), and
+  `autoencoder.*` in a diffusion sweep. The keys the sweep sets itself:
+  `run.project_name` (= `name`), the `outputs_dir` of the phase, `wandb.tags`
+  (`sweep`, `<name>`, `trial_XXXX`), and, in `validate_only`,
+  `run.validate_only` / `run.resume_from_checkpoint`.
+- **W&B.** With `wandb.enabled` (in `fixed` or in the base config), all the
+  trials of a study are in the same W&B group (`project_name` = `name`).
+
+```
+registry/outputs/sweeps/<name>/
+    sweep.yaml       the study definition
+    study.db         Optuna study (SQLite); optuna-dashboard sqlite:///<path> browses it (pip install optuna-dashboard)
+    sweep.log        log of the sweep
+    trials.csv       one row per trial: state, value, last epoch, sampled values, run folder, fail reason
+    best.json        the best completed trial
+    trial_XXXX/
+        console.log  stdout + stderr of the trial
+        <timestamp>/ the run folder, same layout as registry/outputs/<phase>/
+```
+
+Selection uses validation metrics only. Re-train the best configuration
+at full scale (more epochs, full dataset) before reporting it. Every
+phase-2 trial keeps `checkpoints/best` and one final `checkpoint-<step>`:
+delete the trial folders you no longer need.
 
 ## Note
 

@@ -1,0 +1,26 @@
+# Optuna sweep over the sampling of a TRAINED diffusion model (mode
+# validate_only): every trial only validates the weights of `checkpoint` with
+# the sampled values, no training. Only parameters that do not change the
+# weights belong here (sampler, guider, run.val_num_samples).
+#
+# base_config should be the config the checkpoint was trained with: the
+# run's artifacts/config.yaml is reloadable as it is.
+
+name: sampling_steps_cfg_0
+phase: diffusion
+mode: validate_only
+base_config: [configuration_0.yaml]
+checkpoint: registry/outputs/diffusion/<run>/checkpoints/best
+metric: val_latter_rmse
+direction: minimize
+n_trials: 20
+sampler: tpe
+seed: 0
+n_startup_trials: 6
+
+fixed:
+  diffusion.n_forecast_examples: 0
+
+params:
+  diffusion.sampler_config.params.num_steps: {type: int, low: 10, high: 50, step: 10}
+  diffusion.sampler_config.params.guider_config.params.scale: {type: float, low: 1.0, high: 4.0}

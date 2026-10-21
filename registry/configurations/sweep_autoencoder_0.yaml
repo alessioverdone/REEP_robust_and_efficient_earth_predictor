@@ -1,0 +1,35 @@
+# Optuna sweep over the autoencoder (phase 1), see sweep_diffusion_0.yaml.
+# The trial runs live under registry/outputs/sweeps/, so diffusion's
+# pretrained_path: latest never picks them: to train phase 2 on the best one,
+# pass its checkpoints/best.pt as pretrained_path.
+
+name: autoencoder_arch_lr_0
+phase: autoencoder
+mode: train
+base_config: [configuration_0.yaml]
+metric: val_loss                # val_loss | val_mse (minimize), val_psnr | val_ssim (maximize)
+direction: minimize
+n_trials: 30
+sampler: tpe
+seed: 0
+n_startup_trials: 8
+
+pruning:
+  enabled: true
+  n_startup_trials: 5
+  n_warmup_steps: 5
+  interval_steps: 1
+
+fixed:
+  autoencoder.num_epochs: 30
+  autoencoder.early_stopping_patience: 8
+  autoencoder.examples_every: 10
+
+params:
+  autoencoder.lr: {type: float, low: 1.0e-4, high: 3.0e-3, log: true}
+  autoencoder.weight_decay: {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
+  autoencoder.batch_size: {type: categorical, choices: [16, 32, 64]}
+  autoencoder.block_out_channels:
+    type: categorical
+    choices: {small: [32, 64, 128], base: [64, 128, 256]}
+  autoencoder.layers_per_block: {type: int, low: 1, high: 3}
