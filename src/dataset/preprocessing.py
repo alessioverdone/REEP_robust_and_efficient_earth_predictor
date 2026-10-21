@@ -70,14 +70,14 @@ Configurazione, selezione e split
 All the parameters come from the `preprocessing` section of the config
 (src/config.py, registry/configurations/*.yaml). This script is the only place
 where cubes are selected (preprocessing.limit, see select_cubes) and split by
-location into train / val / test. The outcome goes into
+location into train / val. The outcome goes into
 data/preprocessed/<preprocessing.name>/:
 
     dataset.json      the cubes of each split + parameters + dataset id
                       (src/dataset/dataset_info.py); written last
     stats.json        normalization, keep_map, dropped cubes, diagnostics
     cond_stats.json   min/max of mesodynamic and highresstatic on train
-    {train,val,test}_T<t>.npy, manifest.json   images for the autoencoder
+    {train,val}_T<t>.npy, manifest.json   images for the autoencoder
     config.yaml, preprocessing.log
 
 Both training phases read their cubes from dataset.json and never split again.
@@ -315,35 +315,30 @@ def log_cube_diag(diag: Dict, n_cubes_in: int) -> None:
 
 def split_by_location(files: Sequence[Path],
                       val_frac: float,
-                      test_frac: float,
-                      seed: int) -> Tuple[List[Path], List[Path], List[Path]]:
+                      seed: int) -> Tuple[List[Path], List[Path]]:
     """
-    Split train / val / test per *location*, non per cubo: cubi della stessa
+    Split train / val per *location*, non per cubo: cubi della stessa
     tile sono spazialmente sovrapposti, splittarli a caso creerebbe leakage.
 
-    The locations are shuffled once with the seed: the first ones go to test,
-    the next ones to val, the rest to train. A fraction > 0 always gets at
-    least one location.
+    The locations are shuffled once with the seed: the first ones go to val,
+    the rest to train. A fraction > 0 always gets at least one location.
     """
     locations = sorted({location_of(f) for f in files})
     rng = np.random.default_rng(seed)
     order = [locations[i] for i in rng.permutation(len(locations))]
 
-    n_test = max(1, int(round(test_frac * len(locations)))) if test_frac > 0 else 0
     n_val = max(1, int(round(val_frac * len(locations)))) if val_frac > 0 else 0
-    if n_test + n_val >= len(locations):
+    if n_val >= len(locations):
         raise SystemExit(
-            f"val_frac={val_frac} and test_frac={test_frac} take {n_val} + {n_test} "
-            f"of the {len(locations)} locations available: none left for train. "
-            f"Raise preprocessing.limit or lower the fractions."
+            f"val_frac={val_frac} takes {n_val} of the {len(locations)} locations "
+            f"available: none left for train. "
+            f"Raise preprocessing.limit or lower the fraction."
         )
-    test_locs = set(order[:n_test])
-    val_locs = set(order[n_test:n_test + n_val])
+    val_locs = set(order[:n_val])
 
-    train = [f for f in files if location_of(f) not in test_locs | val_locs]
+    train = [f for f in files if location_of(f) not in val_locs]
     val = [f for f in files if location_of(f) in val_locs]
-    test = [f for f in files if location_of(f) in test_locs]
-    return train, val, test
+    return train, val
 
 
 def sample_evenly(files: Sequence[Path],
@@ -1303,13 +1298,12 @@ def main() -> None:
                                                           pre,
                                                           times,
                                                           drop_cube_on_empty)
-    train_files, val_files, test_files = split_by_location(selected,
-                                                           pre.val_frac,
-                                                           pre.test_frac,
-                                                           pre.seed)
+    train_files, val_files = split_by_location(selected,
+                                               pre.val_frac,
+                                               pre.seed)
 
     logger.info(f"Cubi scelti  : {len(selected)}")
-    for split, split_list in (("train", train_files), ("val", val_files), ("test", test_files)):
+    for split, split_list in (("train", train_files), ("val", val_files)):
         logger.info(f"  {split:5s}      : {len(split_list)} cubi, "
                     f"{len({location_of(f) for f in split_list})} location")
     logger.info(f"Versioni T   : {times} (controlli sui primi "
@@ -1343,7 +1337,7 @@ def main() -> None:
     logger.info("[2/4] Scarto cubi, selezione istanti e quantili 5%/95% per banda...")
     (stats, train_ok, held_ok, skipped, keep_map, drops, cube_drops,
      cube_diag) = compute_stats(
-        train_files, val_files + test_files, times, pre.n_bands,
+        train_files, val_files, times, pre.n_bands,
         edge_lo, edge_hi, pre.drop_threshold, pre.workers, pre.chunk,
         drop_cube_on_empty=drop_cube_on_empty,
         static_nan_thr=pre.drop_static_nan_frac,
@@ -1351,7 +1345,6 @@ def main() -> None:
     )
     held = {str(f) for f in held_ok}
     val_ok = [f for f in val_files if str(f) in held]
-    test_ok = [f for f in test_files if str(f) in held]
     # in the limit_after_drop mode the bad cubes were already dropped while
     # choosing the sample: they are reported together with the others
     skipped = selection_skipped + skipped
@@ -1390,7 +1383,6 @@ def main() -> None:
         "times": times,
         "check_frames": pre.check_frames,
         "val_frac": pre.val_frac,
-        "test_frac": pre.test_frac,
         "seed": pre.seed,
         "hist_bins": HIST_BINS,
         "normalization": (
@@ -1445,12 +1437,12 @@ def main() -> None:
                            force=True)
 
     # --- spazio disco, ora che si conosce il numero reale di righe ----------
-    splits = {"train": train_ok, "val": val_ok, "test": test_ok}
+    splits = {"train": train_ok, "val": val_ok}
     itemsize = np.dtype(pre.dtype).itemsize
     row_bytes = pre.n_bands * 128 * 128 * itemsize
     need = 0
     for t in times:
-        for f in train_ok + val_ok + test_ok:
+        for f in train_ok + val_ok:
             need += len([u for u in keep_map.get(str(f), []) if u < t]) * row_bytes
     free = shutil.disk_usage(out_dir).free
     logger.info(f"Spazio richiesto: {human_bytes(need)} | disponibile: {human_bytes(free)}")

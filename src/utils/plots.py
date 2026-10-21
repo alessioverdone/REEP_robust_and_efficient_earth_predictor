@@ -29,12 +29,10 @@ def read_history(history_csv: str) -> dict:
 def plot_history(history_csv: str,
                  out_dir: str,
                  metrics: tuple,
-                 best_epoch: int = None,
-                 test_metrics: dict = None):
+                 best_epoch: int = None):
     """
     One figure per metric (<metric>.png): train and val per epoch, the best
-    epoch as a dotted vertical line and the test value of the best checkpoint
-    as a dashed horizontal line. Plus lr.png with the learning rate.
+    epoch as a dotted vertical line. Plus lr.png with the learning rate.
     """
     if not os.path.isfile(history_csv):
         return
@@ -59,11 +57,6 @@ def plot_history(history_csv: str,
                        color="gray",
                        linestyle=":",
                        label=f"best (epoch {best_epoch})")
-        if test_metrics and metric in test_metrics:
-            ax.axhline(test_metrics[metric],
-                       color="black",
-                       linestyle="--",
-                       label=f"test, best weights ({test_metrics[metric]:.4g})")
         ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         ax.set_xlabel("epoch")
         ax.set_ylabel(metric)
@@ -217,6 +210,9 @@ def plot_diffusion_history(history_csv: str,
         pixel_rmse.png   validation RMSE in pixel space on the two halves of the
                          predicted frames; the second half selects the best model
         lr.png           learning rate at the end of each epoch
+        ens.png          EarthNetScore, validation and training sample (with `ens`)
+        ens_subscores.png  MAD, OLS, EMD, SSIM
+        ens_mae.png      P-MAE and N-MAE
     """
     if not os.path.isfile(history_csv):
         return
@@ -225,10 +221,12 @@ def plot_diffusion_history(history_csv: str,
         return
 
     _epoch_figure(history,
-                  (("train_loss", "train", "-"),),
+                  (("train_loss", "train", "-"),
+                   ("val_loss", "val (diffusion.save_best_by=loss)", "-")),
                   ylabel="loss",
                   title="diffusion loss",
-                  path=os.path.join(out_dir, "loss.png"))
+                  path=os.path.join(out_dir, "loss.png"),
+                  best_epoch=best_epoch)
     _epoch_figure(history,
                   (("train_latent_rmse", "train (one denoising step)", "-"),
                    ("val_predict_latent_rmse", "val (sampled)", "-"),
@@ -245,6 +243,38 @@ def plot_diffusion_history(history_csv: str,
                   ylabel="RMSE (pixels in [-1, 1])",
                   title="pixel RMSE of the forecast",
                   path=os.path.join(out_dir, "pixel_rmse.png"),
+                  best_epoch=best_epoch)
+
+    # ENS columns (config section `ens`): val_* on the validation epochs, train_* on the
+    # epochs where a sample of training cubes was scored
+    _epoch_figure(history,
+                  (("val_ENS", "val", "-"),
+                   ("train_ENS", "train (sample of cubes)", "-")),
+                  ylabel="ENS (higher is better)",
+                  title="EarthNetScore of the forecast",
+                  path=os.path.join(out_dir, "ens.png"),
+                  best_epoch=best_epoch)
+    _epoch_figure(history,
+                  (("val_MAD", "val MAD", "-"),
+                   ("val_OLS", "val OLS", "-"),
+                   ("val_EMD", "val EMD", "-"),
+                   ("val_SSIM", "val SSIM", "-"),
+                   ("train_MAD", "train MAD", "--"),
+                   ("train_OLS", "train OLS", "--"),
+                   ("train_EMD", "train EMD", "--"),
+                   ("train_SSIM", "train SSIM", "--")),
+                  ylabel="sub-score (higher is better)",
+                  title="ENS sub-scores",
+                  path=os.path.join(out_dir, "ens_subscores.png"),
+                  best_epoch=best_epoch)
+    _epoch_figure(history,
+                  (("val_P_MAE", "val P-MAE (bands)", "-"),
+                   ("val_N_MAE", "val N-MAE (NDVI)", "-"),
+                   ("train_P_MAE", "train P-MAE (bands)", "--"),
+                   ("train_N_MAE", "train N-MAE (NDVI)", "--")),
+                  ylabel="mean absolute error (reflectance, valid pixels)",
+                  title="MAE of the forecast",
+                  path=os.path.join(out_dir, "ens_mae.png"),
                   best_epoch=best_epoch)
 
     if "lr" in history:

@@ -52,7 +52,13 @@ class StandardDiffusionLoss(nn.Module):
 
 
 
-    def __call__(self, network, denoiser, conditioner, input, batch, input_future, x_past_mean, decode_first_stage):
+    def __call__(self, network, denoiser, conditioner, input, batch, input_future, x_past_mean, decode_first_stage,
+                 valid_mask=None):
+        """
+        valid_mask: None = the loss runs on every pixel. Otherwise (b, t, 1, H, W) with
+        1 = valid pixel of the target frames (the cloud mask of the ENS): only the
+        valid pixels count in the loss.
+        """
 
         cond = conditioner(batch)
         additional_model_inputs = {
@@ -105,8 +111,9 @@ class StandardDiffusionLoss(nn.Module):
 
         # print(f'model_output:{model_output}')
         
-        loss, true_latent_rmse = self.get_latent_space_loss(model_output, latent_space_future, w)
-        loss_mean, true_latent_rmse_mean = self.get_latent_space_loss(x_past_mean, latent_space_future, w)
+        latent_mask = self.latent_valid_mask(valid_mask, latent_space_future)
+        loss, true_latent_rmse = self.get_latent_space_loss(model_output, latent_space_future, w, latent_mask)
+        loss_mean, true_latent_rmse_mean = self.get_latent_space_loss(x_past_mean, latent_space_future, w, latent_mask)
 
         # loss_latent_space, true_latent_rmse, min_latent_rmse, max_latent_rmse = self.get_latent_space_loss(model_output, latent_space_future, w)
         # mean_loss_latent_space, mean_true_latent_rmse, mean_min_latent_rmse, mean_max_latent_rmse = self.get_latent_space_loss(x_past_mean, latent_space_future, w)
@@ -168,18 +175,44 @@ class StandardDiffusionLoss(nn.Module):
         # 默认是l2, mse
         return mse, true_rmse
     
-    def get_latent_space_loss(self, pred, target, w):
+    @staticmethod
+    def latent_valid_mask(valid_mask, latent):
+        """
+        Pixel mask (b,t,1,H,W) -> weights (b,t,1,h,w) at the resolution of the latent
+        (b,t,c,h,w): every latent cell weighs the fraction of its pixels that are valid
+        (area interpolation, as the images are resized). None stays None.
+        """
+        if valid_mask is None:
+            return None
+        b, t, _, h, w = latent.shape
+        mask = valid_mask.to(device=latent.device, dtype=torch.float32)
+        assert mask.shape[:2] == (b, t), f'mask {tuple(mask.shape)} does not match the latent {tuple(latent.shape)}'
+        if tuple(mask.shape[-2:]) != (h, w):
+            mask = F.interpolate(mask.flatten(0, 1), size=(h, w), mode="area").unflatten(0, (b, t))
+        return mask
+
+    def get_latent_space_loss(self, pred, target, w, mask=None):
         # the shape of pred, target and w should be b,t,c,h,w
         # the first shape of all inputs are b
+        # mask: None (every pixel) or (b,t,1,h,w) weights, see latent_valid_mask
         assert pred.numel() == target.numel(), f'size of pred not equal to target: pred:{pred.numel()}, target:{target.numel()}'     
 
-        mse = torch.mean(
-            (w * (pred - target) ** 2).reshape(target.shape[0], -1), 1
-            )  # b
-        mse_loss = torch.mean(mse)
-        true_rmse = torch.sqrt(torch.mean((pred - target) ** 2))
-
-        angle_loss = self.latent_vector_angle_difference(pred, target)
+        if mask is None:
+            mse = torch.mean(
+                (w * (pred - target) ** 2).reshape(target.shape[0], -1), 1
+                )  # b
+            mse_loss = torch.mean(mse)
+            true_rmse = torch.sqrt(torch.mean((pred - target) ** 2))
+            angle_loss = self.latent_vector_angle_difference(pred, target)
+        else:
+            m = mask.float().expand_as(target)
+            sq_err = ((pred - target) ** 2).float()
+            # per cube: weighted mean over its valid cells (a cube without any gives 0)
+            mse = torch.sum((w * m * sq_err).reshape(target.shape[0], -1), 1) \
+                / (torch.sum(m.reshape(target.shape[0], -1), 1) + 1e-8)  # b
+            mse_loss = torch.mean(mse)
+            true_rmse = torch.sqrt(torch.sum(m * sq_err) / (torch.sum(m) + 1e-8))
+            angle_loss = self.latent_vector_angle_difference(pred, target, mask)
         loss = mse_loss + angle_loss
         
         # # 计算均方根误差
@@ -200,14 +233,20 @@ class StandardDiffusionLoss(nn.Module):
         return loss, true_rmse
 
 
-    def latent_vector_angle_difference(self, pred, target):
-        # 输入图像形状应该为b,t,c,h,w
+    def latent_vector_angle_difference(self, pred, target, mask=None):
+        # 输入图像形状应该为b,t,c,h,w; mask: None or (b,t,1,h,w) weights
         pred_flat = rearrange(pred, "b t c h w -> (b t h w) c").contiguous()
         target_flat = rearrange(target, "b t c h w -> (b t h w) c").contiguous()
 
         theta = torch.nn.functional.cosine_similarity(pred_flat, target_flat)  # 取值范围为-1到1
         theta = 1 - theta  # 取值范围为0到2
-        theta = torch.mean(theta)
+        if mask is None:
+            theta = torch.mean(theta)
+        else:
+            # in float32: the sum of the weights runs up to b*t*h*w (~1e4 cells) and in bf16
+            # (8 bits of mantissa) it would be rounded by up to ~0.4%
+            m = rearrange(mask, "b t c h w -> (b t h w c)").float()
+            theta = torch.sum(theta.float() * m) / (torch.sum(m) + 1e-8)
         
         return theta
 

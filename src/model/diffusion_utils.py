@@ -41,6 +41,7 @@ from src.model.sgm.modules.diffusionmodules.metric import EarthnetX_Metric
 from src.model.sgm.util import get_obj_from_str, default
 from src.training.run_outputs import (count_parameters, environment_info, relative_to_project,
                                       save_run_config, write_json)
+from src.training.ens_eval import ENS_KEYS, EnsEvaluator, wrap_with_cloud_mask
 from src.training.state import TrainState
 from src.utils.plots import plot_diffusion_history, plot_lead_time_rmse, save_forecast_grid
 
@@ -763,7 +764,16 @@ def log_videos_local_and_wandb(
         save_dir=None,
         save_counter=None,
         save_limit=0,
+        return_all_samples=False,
 ):
+    """
+    Forecast of a batch of validation cubes and the accumulators of the validation
+    RMSEs (sums, see VAL_SUM_KEYS). With return_all_samples the K = val_num_samples predictions of every cube
+    are decoded to pixels and returned in forecast["pred_samples"] (a list of K
+    (B, T, C, H, W) tensors in [-1, 1], the first one is forecast["pred"]): the ENS
+    keeps the best of them. Without it only the first one is decoded, the other K-1
+    stay in the latent space for the latent RMSEs.
+    """
     device = batch[input_key].device
     weight_dtype = batch[input_key].dtype
 
@@ -789,6 +799,8 @@ def log_videos_local_and_wandb(
             if not torch.is_tensor(out):
                 out = out.sample
         return out.to(input_tensor.dtype)
+
+    extra_pixel_samples = []     # the samples 2..K in pixels, only with return_all_samples
 
     def validate_and_log(
             batch,
@@ -935,6 +947,13 @@ def log_videos_local_and_wandb(
             per_cube_se.append(torch.sum((extra - fut) ** 2, dim=(1, 2, 3, 4),
                                          dtype=torch.float64))
             latent_sum += extra
+            if return_all_samples:
+                extra_pixel_samples.append(torch.clamp(
+                    decode_first_stage(first_stage_model,
+                                       rearrange(extra.to(device, dtype=weight_dtype),
+                                                 "b t c h w -> (b t) c h w").contiguous()
+                                       ).view(B, noise_image_num, C, H, W),
+                    -1.0, 1.0))
         predict_se = torch.stack(per_sample_se).mean()
         mean_latent = latent_sum / float(val_num_samples)
         mean_k_se = torch.sum((mean_latent - fut) ** 2, dtype=torch.float64)
@@ -993,6 +1012,8 @@ def log_videos_local_and_wandb(
             "context": context,
             "target": target,
             "pred": pred,
+            # the K predictions (see return_all_samples); only the first one without it
+            "pred_samples": [pred] + extra_pixel_samples,
         }
 
         # Ordine fisso, e' la chiave con cui il chiamante somma: vedi VAL_SUM_KEYS.
@@ -1027,6 +1048,70 @@ def log_videos_local_and_wandb(
     conditioner.train()
     # return btach_metric_rgbn, btach_metric_ndvi, batch_upper_limit_rgbn, batch_upper_limit_ndvi, batch_mean_rgbn, batch_mean_ndvi, batch_decode_mean_rgbn, batch_decode_mean_ndvi, validate_log
     return validate_log, batch_sums, forecast
+
+
+def validation_loss(loss_fn,
+                    model,
+                    denoiser,
+                    conditioner,
+                    first_stage_model,
+                    batch,
+                    config_diffusion,
+                    noise_image_num,
+                    weight_dtype,
+                    valid_mask=None,
+                    seed=0):
+    """
+    The training loss on a validation batch (no gradient, eval mode): what
+    diffusion.save_best_by=loss compares across epochs. Returns its mean over the cubes.
+
+    The training loss is stochastic: every call draws a sigma per cube and a noise, and
+    the conditioner randomly drops the conditions (ucg_rate, for classifier-free
+    guidance). On the same weights and batch that makes the number vary a lot (with the
+    heavy-tailed min-SNR weights, from 25% to several times its value between two
+    calls), so the "best" epoch would be a lottery. Here the draws come from a generator
+    seeded with `seed` (the caller passes the same one for the same batch at every
+    validation, so the weights are compared on the same sigmas and noises) and restored
+    afterwards, leaving the RNG of the training untouched, and the condition dropout is off.
+    """
+    x = batch[config_diffusion.input_key]
+    device = x.device
+    cuda_devices = ([device.index if device.index is not None else torch.cuda.current_device()]
+                    if device.type == "cuda" else [])
+    embedders = list(getattr(conditioner, "module", conditioner).embedders)
+    ucg_rates = [embedder.ucg_rate for embedder in embedders]
+
+    model.eval()
+    conditioner.eval()
+    try:
+        for embedder in embedders:
+            embedder.ucg_rate = 0.0
+        with torch.no_grad(), torch.random.fork_rng(devices=cuda_devices):
+            torch.manual_seed(seed)
+            B, T, C, H, W = x.shape
+            x_future = x[:, -noise_image_num:, ...]
+            x_past_mean = encode_first_stage(
+                torch.mean(x[:, :-noise_image_num, ...], dim=1).contiguous(),
+                first_stage_model, config_diffusion).to(dtype=weight_dtype)
+            z = encode_first_stage(x.view(B * T, C, H, W).contiguous(),
+                                   first_stage_model, config_diffusion).to(dtype=weight_dtype)
+            z = z.view(B, T, *z.shape[1:]).contiguous()
+            loss = loss_fn(model, denoiser, conditioner, z, batch, x_future, x_past_mean,
+                           functools.partial(decode_first_stage,
+                                             first_stage_model=first_stage_model,
+                                             config_diffusion=config_diffusion),
+                           valid_mask=valid_mask)[0]
+    finally:
+        for embedder, rate in zip(embedders, ucg_rates):
+            embedder.ucg_rate = rate
+        model.train()
+        conditioner.train()
+    return float(loss.float().mean())
+
+
+def _fmt_ens(value):
+    """An ENS statistic for the log: 6 decimals, or n/a when the cubes gave none."""
+    return "n/a" if value is None else f"{value:.6f}"
 
 
 def count_params(m: torch.nn.Module):
@@ -1125,7 +1210,18 @@ def setup_dataloader(cfg,
     datamodule = instantiate_from_config(config_data)
     with accelerator.main_process_first():
         datamodule.setup("fit")
+    loss_on_valid = config_diffusion.loss_pixels == "valid"
+    # loss_pixels=valid: the training cubes carry the cloud mask of their target frames
+    # (read from the original .npz, same rule as the ENS), to leave the cloudy pixels
+    # out of the loss. The model never sees it: train_loop takes it out of the batch.
+    if loss_on_valid:
+        datamodule.train_dataset = wrap_with_cloud_mask(datamodule.train_dataset, cfg.ens)
     train_dataloader = datamodule.train_dataloader()
+    # ens.validation (or loss_pixels=valid, for the validation loss): the validation
+    # cubes carry the cloud mask too, to leave the cloudy pixels out of the ENS.
+    if (((cfg.ens.enabled and cfg.ens.validation and cfg.ens.cloud_mask) or loss_on_valid)
+            and datamodule.val_dataset is not None):
+        datamodule.val_dataset = wrap_with_cloud_mask(datamodule.val_dataset, cfg.ens)
     val_dataloader = datamodule.val_dataloader()
     if val_dataloader is None:
         raise RuntimeError(
@@ -1319,7 +1415,8 @@ def resolve_resume_checkpoint(cfg,
 
 
 def _inherit_history(state,
-                     resume_from):
+                     resume_from,
+                     save_best_by="rmse"):
     """
     When resuming from a checkpoint of an earlier run, copy that run's
     history.csv and lead_time.csv rows up to the resumed epoch, so the curves
@@ -1349,18 +1446,27 @@ def _inherit_history(state,
     if int(best.get("global_step", 0)) > state.global_step:
         # saved after the resumed checkpoint: not part of this run's history
         return
-    state.best_latter_rmse = float(best["latter_rmse"])
+    criterion = best.get("criterion", "rmse")      # runs older than save_best_by used latter_rmse
+    if criterion != save_best_by:
+        logger.warning(f"best of {best_metric_file} was chosen by {criterion!r}, this run uses "
+                       f"{save_best_by!r}: its best is not inherited")
+        return
+    if "criterion_value" in best:
+        state.best_value = float(best["criterion_value"])
+    else:
+        state.best_value = float(best["latter_rmse"])
     state.best_epoch = best.get("epoch")
     state.best_global_step = best.get("global_step")
     state.best_val_metrics = {k: v for k, v in best.items()
-                              if k not in ("epoch", "global_step", "n_cubes", "k")}
+                              if k not in ("epoch", "global_step", "n_cubes", "k",
+                                           "criterion", "criterion_value")}
     state.checkpoints["best"] = {"folder": relative_to_project(os.path.dirname(best_metric_file)),
                                  "inherited": True,
                                  "epoch": state.best_epoch,
                                  "global_step": state.best_global_step,
-                                 "latter_rmse": state.best_latter_rmse}
-    logger.info(f"latter_rmse migliore ripreso da {best_metric_file}: "
-                f"{state.best_latter_rmse:.6f} (epoca {state.best_epoch})")
+                                 "criterion": save_best_by}
+    logger.info(f"best ({save_best_by}) ripreso da {best_metric_file}: "
+                f"{abs(state.best_value):.6f} (epoca {state.best_epoch})")
 
 
 def _load_weights_only(accelerator,
@@ -1460,7 +1566,8 @@ def configure_train(cfg,
         state.epochs_completed = state.first_epoch
         if accelerator.is_main_process:
             _inherit_history(state,
-                             resume_from)
+                             resume_from,
+                             cfg.diffusion.save_best_by)
 
     # Config of the run, saved after everything resolved at start-up (VAE path,
     # scale_factor, checkpoint to resume from), so it says what actually ran.
@@ -1531,7 +1638,6 @@ def describe_run(cfg,
             # the phase-1 run the weights come from, when they are a run's best.pt
             "autoencoder_run": vae_info.get("run", {}).get("run_id"),
             "autoencoder_val_best": vae_info.get("metrics", {}).get("val_best"),
-            "autoencoder_test": vae_info.get("metrics", {}).get("test"),
             "trained_on_dataset": first_stage_info.get("dataset"),
             "latent_normalization": {
                 "mode": cfg.diffusion.latent_normalization,
@@ -1631,7 +1737,8 @@ def training_info(cfg,
                            "max_batches": acc.validate_batch_num},
         },
         "metrics": {
-            "selection_criterion": "val_latter_rmse",
+            "selection_criterion": {"rmse": "val_latter_rmse", "loss": "val_loss",
+                                    "ens": "val_ENS"}[cfg.diffusion.save_best_by],
             "train_last": state.train_metrics,
             "val_last": {"epoch": state.val_epoch,
                          "n_cubes": metrics.n_cubes if state.val_metrics else None,
@@ -1641,6 +1748,11 @@ def training_info(cfg,
                          **state.best_val_metrics},
             "lead_time_rmse": {"last": state.val_lead_time or None,
                                "best": state.best_val_lead_time or None},
+            # ENS statistics (config section `ens`): last validation, last training sample
+            "ens": ({"val_last": state.ens_val or None,
+                     "train_last": state.ens_train or None,
+                     "samples_per_cube": cfg.run.val_num_samples}
+                    if cfg.ens.enabled else None),
         },
         "compute": {
             "wall_time_s": wall_seconds,
@@ -1806,7 +1918,7 @@ def train_loop(cfg,
                loss_fn):
     """
     Il training vero e proprio. `state` (TrainState) arriva da configure_train()
-    e viene fatto avanzare qui: global_step, resume_step, best_latter_rmse e le
+    e viene fatto avanzare qui: global_step, resume_step, best_value e le
     metriche in state.metrics cambiano mentre il loop gira, quindi si leggono e
     si scrivono sempre sull'oggetto, non su copie locali.
     After every epoch: history.csv, curves, training_info.json; at every
@@ -1822,6 +1934,28 @@ def train_loop(cfg,
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / config_accelerate.gradient_accumulation_steps)
     # the columns of the validation metrics, also on the epochs without one
     val_keys = list(validation_rmse([0.0] * len(VAL_SUM_KEYS)))
+    # which validation epoch becomes checkpoints/best (config diffusion.save_best_by)
+    save_best_by = cfg.diffusion.save_best_by
+    if save_best_by == "loss":
+        val_keys.append("loss")             # val_loss column in history.csv
+
+    # ENS (config section `ens`): scoring of the forecasts, shared with evaluate_ens.py.
+    # ens_columns = the columns it adds to history.csv, empty (they stay empty on the
+    # epochs where nothing is scored, so the header never changes).
+    ens_cfg = cfg.ens
+    loss_on_valid = config_diffusion.loss_pixels == "valid"   # diffusion loss on the cloud-free pixels only
+    if loss_on_valid:
+        logger.info(f"[loss] only the valid pixels of the target frames (cloud probability < "
+                    f"{ens_cfg.cloud_prob_threshold}, scale {ens_cfg.cloud_prob_scale})")
+    ens_eval = EnsEvaluator(cfg, accelerator, train_dataloader) if ens_cfg.enabled else None
+    ens_columns = ens_eval.columns() if ens_eval is not None else {}
+    if ens_eval is not None:
+        logger.info(f"[ens] on: validation={ens_cfg.validation}, train={ens_cfg.train}"
+                    + (f" ({ens_cfg.train_cubes} cubes every {ens_cfg.train_every_epochs} "
+                       f"epoch(s), {'fixed' if ens_cfg.train_fixed_subset else 'random'} sample)"
+                       if ens_cfg.train else "")
+                    + f" | K={args.val_num_samples} predictions per cube, best kept"
+                    f" | cloud mask {'on' if ens_cfg.cloud_mask else 'off'}")
 
     write_training_info(cfg,
                         rt,
@@ -1902,6 +2036,8 @@ def train_loop(cfg,
 
         # Start Train!
         for step, batch in enumerate(epoch_dataloader):
+            batch.pop("hflip", None)                 # only for the cloud mask (MaskedCubeDataset)
+            loss_mask = batch.pop("cloud_mask", None) if loss_on_valid else None
             for batch_key in batch.keys():
                 if torch.is_tensor(batch[batch_key]):
                     batch[batch_key] = batch[batch_key].to(dtype=weight_dtype)
@@ -1936,7 +2072,8 @@ def train_loop(cfg,
                             # expects a one-argument decode(latent) function
                             functools.partial(decode_first_stage,
                                               first_stage_model=first_stage_model,
-                                              config_diffusion=config_diffusion))  # b
+                                              config_diffusion=config_diffusion),
+                            valid_mask=loss_mask)  # b
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(config_data.params.batch_size)).mean()
@@ -2011,6 +2148,9 @@ def train_loop(cfg,
         val_rmse = None
         n_cubes = None
         val_seconds = None
+        ens_row = dict(ens_columns)             # what the ENS adds to this epoch's history row
+        if ens_eval is not None:
+            ens_eval.scoring_seconds = 0.0
         if (epoch % config_accelerate.validate_epoch_interval == 0 or is_last_epoch
                 or args.validate_only):
             validate_start_time = time.time()  # <--- START TIMER INFERENZA
@@ -2028,6 +2168,12 @@ def train_loop(cfg,
             lead_totals = torch.zeros(3, noise_image_num, device=accelerator.device,
                                       dtype=torch.float64)
             n_val_batches = 0
+            # diffusion.save_best_by=loss: sum of the loss * cubes, and the cubes
+            val_loss_totals = (torch.zeros(2, device=accelerator.device, dtype=torch.float64)
+                               if save_best_by == "loss" else None)
+            # ENS: one row per cube, filled batch by batch with the forecasts the RMSEs
+            # already need (no second inference)
+            ens_val_rows = [] if (ens_eval is not None and ens_cfg.validation) else None
 
             # Immagini di confronto, un PNG per cubo (ground truth sopra,
             # predizione sotto, con il nome del .npz di origine), solo
@@ -2052,6 +2198,7 @@ def train_loop(cfg,
             for batch_num, batch in enumerate(val_dataloader):
                 if batch_num >= config_accelerate.validate_batch_num:
                     break
+                cloud = batch.pop("cloud_mask", None)    # for the ENS only, not for the model
                 for batch_key in batch.keys():
                     if torch.is_tensor(batch[batch_key]):
                         batch[batch_key] = batch[batch_key].to(dtype=weight_dtype)
@@ -2073,7 +2220,23 @@ def train_loop(cfg,
                     metrics_rgbn=validate_metric_rgbn,
                     metrics_ndvi=validate_metric_ndvi,
                     metrics_arvi=validate_metric_arvi,
+                    return_all_samples=ens_val_rows is not None,
                 )
+                if ens_val_rows is not None:
+                    ens_eval.add_batch(ens_val_rows, forecast["pred_samples"],
+                                       forecast["target"], cloud, batch.get("cube_path"))
+                if val_loss_totals is not None:
+                    # the training loss on the validation batch, with fixed random draws
+                    # (the seed depends on the batch only, so every validation uses the same
+                    # sigmas and noises) and no condition dropout, see validation_loss
+                    vB = batch[config_diffusion.input_key].shape[0]
+                    val_loss = validation_loss(loss_fn, model, denoiser, conditioner,
+                                               first_stage_model, batch, config_diffusion,
+                                               noise_image_num, weight_dtype,
+                                               valid_mask=cloud if loss_on_valid else None,
+                                               seed=args.seed + batch_num)
+                    val_loss_totals[0] += val_loss * vB
+                    val_loss_totals[1] += vB
                 val_totals += batch_sums
                 lead_totals[0] += forecast["lead_se"]
                 lead_totals[1] += forecast["lead_baseline_se"]
@@ -2111,8 +2274,21 @@ def train_loop(cfg,
             val_totals = accelerator.gather(val_totals.unsqueeze(0)).sum(dim=0)
             lead_totals = accelerator.gather(lead_totals.unsqueeze(0)).sum(dim=0)
             val_rmse = validation_rmse(val_totals)
+            if val_loss_totals is not None:
+                val_loss_totals = accelerator.gather(val_loss_totals.unsqueeze(0)).sum(dim=0)
+                val_rmse["loss"] = float(val_loss_totals[0] / val_loss_totals[1].clamp(min=1))
             n_cubes = int(val_totals[VAL_SUM_KEYS.index("n_cubes")])
             lead_rmse = torch.sqrt(lead_totals[:2] / lead_totals[2].clamp(min=1)).tolist()
+            if ens_val_rows is not None:
+                ens_row.update(ens_eval.finish(ens_val_rows, "val"))
+                state.ens_val = {"epoch": epoch + 1,
+                                 **{k: ens_row[f"val_{k}"] for k in ENS_KEYS},
+                                 "n_cubes": ens_row["val_ens_n_cubes"]}
+                logger.info(f"[validation] ENS={_fmt_ens(ens_row['val_ENS'])} "
+                            f"(MAD={_fmt_ens(ens_row['val_MAD'])} OLS={_fmt_ens(ens_row['val_OLS'])} "
+                            f"EMD={_fmt_ens(ens_row['val_EMD'])} SSIM={_fmt_ens(ens_row['val_SSIM'])}) "
+                            f"P-MAE={_fmt_ens(ens_row['val_P_MAE'])} N-MAE={_fmt_ens(ens_row['val_N_MAE'])} | "
+                            f"{ens_row['val_ens_n_cubes']} cubes, best of K={args.val_num_samples}")
             val_seconds = time.time() - validate_start_time
 
             state.metrics.record_validation(val_rmse, n_cubes, epoch + 1,
@@ -2142,18 +2318,33 @@ def train_loop(cfg,
                     })
 
             # --- salvataggio del modello migliore ---------------------------
-            # Il criterio e' latter_rmse: l'errore sugli ultimi 10 dei 20 frame
-            # predetti, cioe' la parte piu' lontana dal contesto e quella che
-            # separa davvero un modello che estrapola da uno che copia l'ultimo
-            # frame visto.
+            # Il criterio e' diffusion.save_best_by:
+            #   rmse: latter_rmse, l'errore sugli ultimi 10 dei 20 frame predetti,
+            #         cioe' la parte piu' lontana dal contesto e quella che separa
+            #         davvero un modello che estrapola da uno che copia l'ultimo
+            #         frame visto
+            #   loss: la loss di diffusione sul validation set
+            #   ens:  l'ENS sul validation set (piu' alto = meglio)
+            # current_value e' in forma "piu' basso e' meglio" (-ENS per l'ENS).
             # In --validate_only non si salva niente: i pesi sono quelli del
             # checkpoint appena caricato.
-            if (not args.validate_only) and val_rmse["latter_rmse"] < state.best_latter_rmse:
-                previous = state.best_latter_rmse
-                state.best_latter_rmse = val_rmse["latter_rmse"]
+            if save_best_by == "rmse":
+                current_value = val_rmse["latter_rmse"]
+            elif save_best_by == "loss":
+                current_value = val_rmse["loss"]
+            else:
+                ens_value = ens_row.get("val_ENS")
+                current_value = -ens_value if ens_value is not None else float("nan")
+            shown = abs(current_value)
+            criterion_name = {"rmse": "latter_rmse", "loss": "loss", "ens": "ENS"}[save_best_by]
+            if (not args.validate_only) and current_value < state.best_value:
+                previous = abs(state.best_value)
+                state.best_value = current_value
                 state.best_epoch = epoch + 1
                 state.best_global_step = state.global_step
                 state.best_val_metrics = dict(val_rmse)
+                if ens_row.get("val_ENS") is not None:
+                    state.best_val_metrics["ENS"] = ens_row["val_ENS"]
                 state.best_val_lead_time = dict(state.val_lead_time)
                 if accelerator.is_main_process:
                     accelerator.save_state(state.best_ckpt_path)
@@ -2161,22 +2352,73 @@ def train_loop(cfg,
                               "w", encoding="utf-8") as fh:
                         json.dump({"epoch": epoch + 1, "global_step": state.global_step,
                                    "n_cubes": n_cubes, "k": args.val_num_samples,
-                                   **val_rmse}, fh, indent=2)
+                                   "criterion": save_best_by, "criterion_value": current_value,
+                                   **state.best_val_metrics}, fh, indent=2)
                     state.checkpoints["best"] = {"folder": "best",
                                                  "epoch": epoch + 1,
                                                  "global_step": state.global_step,
-                                                 "latter_rmse": state.best_latter_rmse}
+                                                 "criterion": save_best_by,
+                                                 criterion_name: shown}
                     logger.info(
-                        f"[validation] nuovo minimo di latter_rmse: "
-                        f"{state.best_latter_rmse:.6f} (prima {previous:.6f}), "
+                        f"[validation] nuovo migliore per {criterion_name}: "
+                        f"{shown:.6f} (prima {previous:.6f}), "
                         f"stato salvato in {state.best_ckpt_path}"
                     )
                 accelerator.wait_for_everyone()
             elif not args.validate_only:
                 logger.info(
-                    f"[validation] latter_rmse {val_rmse['latter_rmse']:.6f} non "
-                    f"migliora il minimo {state.best_latter_rmse:.6f}, niente da salvare"
+                    f"[validation] {criterion_name} {shown:.6f} non "
+                    f"migliora il migliore {abs(state.best_value):.6f}, niente da salvare"
                 )
+
+        # --- ENS on a sample of training cubes -------------------------------------
+        # Full sampling of ens.train_cubes cubes (no flip, eval mode), as in validation:
+        # it says how far the model is from its own training cubes. It is inference, so it
+        # goes into state.metrics.inference_time and not into the training time.
+        if (ens_eval is not None and ens_cfg.train and not args.validate_only
+                and ((epoch + 1) % ens_cfg.train_every_epochs == 0 or is_last_epoch)):
+            train_eval_start = time.time()
+            ens_train_rows = []
+            for batch in ens_eval.train_loader(epoch):
+                cloud = batch.pop("cloud_mask", None)
+                batch = ens_eval.to_device(batch)
+                for batch_key in batch.keys():
+                    if torch.is_tensor(batch[batch_key]):
+                        batch[batch_key] = batch[batch_key].to(dtype=weight_dtype)
+                _, _, forecast = log_videos_local_and_wandb(
+                    batch=batch,
+                    model=model,
+                    conditioner=conditioner,
+                    first_stage_model=first_stage_model,
+                    sampler=sampler,
+                    denoiser=denoiser,
+                    input_key=config_diffusion.input_key,
+                    config_diffusion=config_diffusion,
+                    noise_image_num=noise_image_num,
+                    past_weigth=config_diffusion.loss_fn_config.params.past_weight,
+                    val_num_samples=args.val_num_samples,
+                    metrics_rgbn=None,
+                    metrics_ndvi=None,
+                    metrics_arvi=None,
+                    return_all_samples=True,
+                )
+                ens_eval.add_batch(ens_train_rows, forecast["pred_samples"],
+                                   forecast["target"], cloud, batch.get("cube_path"))
+            ens_row.update(ens_eval.finish(ens_train_rows, "train"))
+            ens_row["ens_train_eval_time_s"] = time.time() - train_eval_start
+            state.metrics.inference_time += ens_row["ens_train_eval_time_s"]
+            state.ens_train = {"epoch": epoch + 1,
+                               **{k: ens_row[f"train_{k}"] for k in ENS_KEYS},
+                               "n_cubes": ens_row["train_ens_n_cubes"]}
+            logger.info(f"[ens] epoch {epoch + 1} | TRAIN sample: ENS={_fmt_ens(ens_row['train_ENS'])} "
+                        f"(MAD={_fmt_ens(ens_row['train_MAD'])} OLS={_fmt_ens(ens_row['train_OLS'])} "
+                        f"EMD={_fmt_ens(ens_row['train_EMD'])} SSIM={_fmt_ens(ens_row['train_SSIM'])}) "
+                        f"P-MAE={_fmt_ens(ens_row['train_P_MAE'])} N-MAE={_fmt_ens(ens_row['train_N_MAE'])} | "
+                        f"{ens_row['train_ens_n_cubes']} cubes, best of K={args.val_num_samples}, "
+                        f"{ens_row['ens_train_eval_time_s']:.0f}s")
+
+        if ens_eval is not None:
+            ens_row["ens_scoring_time_s"] = ens_eval.scoring_seconds or None
 
         if accelerator.is_main_process:
             # the K-sample columns only when K > 1: with K = 1 they repeat predict_latent_rmse
@@ -2194,6 +2436,7 @@ def train_loop(cfg,
                 "epoch_train_time_s": train_seconds if epoch_steps else None,
                 "epoch_val_time_s": val_seconds,
                 "train_cubes_per_s": epoch_cubes / train_seconds if epoch_steps else None,
+                **ens_row,
             }
             append_history_row(state.history_csv,
                                history_row)

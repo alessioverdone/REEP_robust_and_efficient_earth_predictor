@@ -21,14 +21,13 @@ paths:
   checkpoints_dir: registry/checkpoints   # checkpoints promoted by hand
   outputs_dir: registry/outputs           # one timestamped folder per run
 
-# The only place where cubes are selected and split (train / val / test by
+# The only place where cubes are selected and split (train / val by
 # location): both phases read the result from <preprocessed_dir>/dataset.json.
 preprocessing:
   # name: n${.limit}_s${.seed}     (default, the folder under data/preprocessed/)
   limit: 1000                 # 0 = all the cubes
   limit_after_drop: false     # true = `limit` counts the cubes left after dropping the bad ones
   val_frac: 0.1
-  test_frac: 0.1
   seed: 0
   times: [10]                 # .npy files for the autoencoder; must contain autoencoder.T
   dtype: float16
@@ -41,7 +40,7 @@ preprocessing:
 
 autoencoder:
   # preprocessed_dir, outputs_dir, image_size (= data.params.resize) and the
-  # train/val/test .npy files are derived: the splits come from the preprocessing
+  # train/val .npy files are derived: the splits come from the preprocessing
   T: 10
   batch_size: 32
   num_workers: 4
@@ -81,6 +80,8 @@ diffusion:
   channel_shift_factors: null # shift_scale_per_channel only; null = read from the VAE checkpoint
   channel_scale_factors: null
   disable_first_stage_autocast: true
+  loss_pixels: all            # pixels of the diffusion loss: all (every pixel) | valid (only the cloud-free ones of the target frames, same rule as the ENS: ens.cloud_prob_threshold / cloud_prob_scale)
+  save_best_by: rmse         # epoch kept as checkpoints/best: rmse (lowest val latter_rmse) | loss (lowest val loss, same draws at every validation) | ens (highest val ENS, needs ens.enabled)
   input_key: imgs
   img_log_step_inteval: 1000000
   log_keys: [txt]
@@ -218,6 +219,41 @@ accelerate:
   logging_steps: 500
   validate_epoch_interval: 10
   validate_batch_num: 10000
+
+# EarthNet metrics during the diffusion training (phase 2): ENS = harmonic mean of
+# MAD, OLS, EMD, SSIM, plus SSIM_RAW, P-MAE and N-MAE, the same as
+# src/scripts/evaluate_ens.py (shared code: src/utils/ens_metrics.py). They need real
+# forecasts (full sampling), so they are computed only where inference is done anyway:
+# on the validation set in the validation epochs (accelerate.validate_epoch_interval),
+# and optionally on a sample of training cubes. Every cube is predicted
+# run.val_num_samples (K) times and the best prediction (highest ENS) is kept.
+# Columns of history.csv: val_ENS, val_MAD, ... and train_ENS, ...; plots in results/curves/.
+ens:
+  enabled: false
+  validation: true            # on the validation set, in the validation epochs
+  train: false                # also on a sample of training cubes
+  train_cubes: 100            # how many training cubes per evaluation
+  train_every_epochs: 1       # 1 = at the end of every epoch
+  train_fixed_subset: true    # same cubes every time (comparable curves) | new random sample each time
+  scoring: fast               # fast | toolkit
+  ssim_data_range: 2.0
+  cloud_mask: true            # exclude cloudy pixels, read from the original .npz
+  cloud_prob_threshold: 0.20
+  cloud_prob_scale: 100.0
+
+# Evaluation on the EarthNet test splits at the end of the diffusion training (phase 2):
+# when the training loop is over, src/scripts/evaluate_ens.py is run on these splits.
+# Output, same as running the script by hand:
+# <run>/results/statistics/metrics_results_<split>_K_<K>.{json,csv}
+# A failure here (e.g. a missing test folder) does not fail the run: the training is
+# already done, rerun evaluate_ens.py by hand. enabled: false skips it altogether.
+test_eval:
+  enabled: true
+  splits: [iid, ood, extreme, seasonal]
+  checkpoint: best            # best | latest | name of a folder in checkpoints/
+  num_samples: null           # K predictions per cube (best kept); null = run.val_num_samples
+  subset: 0                   # 0 = every cube | N = N random cubes (quick test)
+  seed: 42
 
 # Live report on Weights & Biases (both phases): metrics, artifacts/ and
 # results/ files, example images. Never the checkpoints. Online needs `wandb login`.

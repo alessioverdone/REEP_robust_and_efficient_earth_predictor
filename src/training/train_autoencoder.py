@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 def setup_dataloader(cfg):
     """
-    I DataLoader (train, val, test), la composizione dei tre split e il numero
+    I DataLoader (train, val), la composizione dei due split e il numero
     di bande.
 
     I dati arrivano dal preprocessing gia' normalizzati in [-1, 1] e appiattiti
@@ -53,7 +53,6 @@ def setup_dataloader(cfg):
     auto = cfg.autoencoder
     loaders, composition = make_dataloaders(train_npy=auto.train_npy,
                                             val_npy=auto.val_npy,
-                                            test_npy=auto.test_npy,
                                             manifest=auto.manifest,
                                             batch_size=auto.batch_size,
                                             num_workers=auto.num_workers,
@@ -227,7 +226,6 @@ def describe_run(cfg,
             "selection": dataset.get("selection"),
             "train_npy": auto.train_npy,
             "val_npy": auto.val_npy,
-            "test_npy": auto.test_npy,
             "manifest": auto.manifest,
             "stats_json": f"{auto.preprocessed_dir}/stats.json",
             "normalization": "per-band quantile scaling to [-1, 1] (see stats_json)",
@@ -330,9 +328,6 @@ def training_info(cfg,
             "val_last": state.val_metrics,
             "val_best": {"epoch": state.best_epoch,
                          **state.best_val_metrics},
-            "test": {"weights": "best (epoch below)" if state.test_metrics else None,
-                     "epoch": state.best_epoch if state.test_metrics else None,
-                     **state.test_metrics},
         },
         # diffusion.scale_factor / shift_factor for phase 2, also saved in best.pt
         "scale_factor": state.scale_factor or None,
@@ -341,7 +336,6 @@ def training_info(cfg,
             "wall_time_s": wall_seconds,
             "train_time_s": train_seconds,
             "validation_time_s": metrics.inference_time,
-            "test_time_s": state.test_seconds,
             "mean_epoch_train_time_s": (train_seconds / len(state.epoch_seconds)
                                         if state.epoch_seconds else None),
             "mean_train_images_per_s": (float(np.mean(state.images_per_second))
@@ -389,8 +383,7 @@ def update_figures(outputs,
     plot_history(outputs.history_csv,
                  outputs.curves,
                  metrics=("loss", "mse", "psnr", "ssim"),
-                 best_epoch=state.best_epoch,
-                 test_metrics=state.test_metrics or None)
+                 best_epoch=state.best_epoch)
 
 
 def mark_run_ended(cfg,
@@ -418,7 +411,6 @@ def mark_run_ended(cfg,
     logger.info(f"[autoencoder] run {state.status}: {outputs.info_json}")
     rt.tracker.summary({"best/epoch": state.best_epoch,
                         **{f"best/val_{k}": v for k, v in state.best_val_metrics.items()},
-                        **{f"test/{k}": v for k, v in state.test_metrics.items()},
                         "latent/scale_factor": state.scale_factor.get("value"),
                         "latent/shift_factor": state.scale_factor.get("shift_factor")})
     rt.tracker.finish(state.status,
@@ -647,7 +639,7 @@ def train_vae(cfg,
         validate_start_time = time.time()
         val_metrics, n_val_images = evaluate_vae(cfg, rt, vae, loaders["val"])
         val_seconds = time.time() - validate_start_time
-        state.metrics.record_validation(val_metrics, n_val_images, epoch,
+        state.metrics.record_validation(val_metrics, n_val_images, epoch + 1,
                                         state.global_step,
                                         val_seconds)
         state.train_metrics = train_metrics
@@ -744,53 +736,6 @@ def train_vae(cfg,
     for line in state.metrics.summary_lines():
         logger.info(line)
     logger.info(f"[autoencoder] training terminato, storia in {state.history_csv}")
-    return state
-
-
-# ================================== TEST ==================================
-
-def test_vae(cfg,
-             rt,
-             outputs,
-             state,
-             vae,
-             loaders):
-    """
-    Evaluates the best weights (not the last epoch) on the test set, saves
-    test examples and redraws the curves with the test values on them. The
-    weights are the in-memory copy of best.pt, so this works also with
-    save_checkpoints=false.
-    """
-    if loaders["test"] is None:
-        logger.info("[autoencoder] autoencoder.test_npy non impostato: niente test")
-        return state
-    if state.best_state_dict is None:
-        # no epoch completed, or a resumed run that never beat the resumed best
-        logger.info("[autoencoder] nessun peso migliore in questo run: niente test")
-        return state
-
-    vae.load_state_dict(state.best_state_dict)
-    test_start = time.time()
-    test_metrics, n_test_images = evaluate_vae(cfg,
-                                               rt,
-                                               vae,
-                                               loaders["test"],
-                                               desc="Test")
-    state.test_seconds = time.time() - test_start
-    state.test_metrics = test_metrics
-
-    logger.info(f"[autoencoder] TEST best (epoca {state.best_epoch}, {n_test_images} immagini) | "
-                + " ".join(f"{k}={v:.6f}" for k, v in test_metrics.items()))
-
-    save_examples(cfg,
-                  rt,
-                  vae,
-                  example_batch(loaders["test"].dataset,
-                                cfg.autoencoder.n_recon_examples),
-                  os.path.join(outputs.examples, "test_best.png"),
-                  title=f"test, best weights (epoch {state.best_epoch})")
-    update_figures(outputs,
-                   state)
     return state
 
 

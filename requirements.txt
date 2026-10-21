@@ -71,7 +71,11 @@ tqdm
 wandb                     # tracker di accelerate (per ora offline e commentato)
 optuna>=4                 # src/training/sweep.py (hyperparameter search)
 
-# ---- Dataset EarthNet ----
-# Serve solo a src/dataset/ (download ed esplorazione dei minicubi): per il
-# solo training si puo' omettere.
+# ---- Dataset EarthNet e metriche ENS ----
+# Serve a src/dataset/ (download ed esplorazione dei minicubi) e all'ENS
+# (src/utils/ens_metrics.py: OLS e' una chiamata a earthnet.parallel_score), cioe' alla
+# sezione `ens` del config, a `test_eval` (attivo di default) e agli script
+# evaluate_ens.py / evaluate_ae_ens.py. Con ens.enabled=false e test_eval.enabled=false
+# il solo training puo' farne a meno.
 earthnet
+scikit-image              # structural_similarity: la SSIM dell'ENS (importata direttamente)

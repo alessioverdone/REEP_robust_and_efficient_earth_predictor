@@ -190,9 +190,28 @@ def compute_batch_psnr(recon, target, data_range=2.0, eps=1e-12):
 
 def append_history_row(csv_path, row_dict):
     file_exists = os.path.exists(csv_path)
+    header = list(row_dict.keys())
+
+    if file_exists:
+        # The file's header decides where each cell goes, not the order of the keys of
+        # this row. A row with columns the file does not have yet (e.g. val_loss or the
+        # ENS columns, in a run resumed from a history written without them): the file is
+        # rewritten with the wider header, the old rows keep their cells and get empty
+        # ones. A row without some of the columns of the file leaves those cells empty.
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            header = list(reader.fieldnames or [])
+            new_columns = [k for k in row_dict if k not in header]
+            old_rows = list(reader) if new_columns else []
+        if new_columns:
+            header += new_columns
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=header)
+                writer.writeheader()
+                writer.writerows(old_rows)
 
     with open(csv_path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row_dict.keys()))
+        writer = csv.DictWriter(f, fieldnames=header, restval="")
 
         if not file_exists:
             writer.writeheader()

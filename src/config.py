@@ -156,9 +156,8 @@ class PreprocessingCfg:
     limit_after_drop: bool = False
 
     # Split by location (cubes of the same tile overlap spatially): fractions
-    # of the locations held out for validation and test.
+    # of the locations held out for validation.
     val_frac: float = 0.1
-    test_frac: float = 0.1
     seed: int = 0
 
     # Temporal versions of the .npy files for the autoencoder (first T frames
@@ -192,12 +191,11 @@ class AutoencoderCfg:
     # Conviene partire da T=10 e passare a T=30 solo se si vede overfitting.
     T: int = 10
 
-    # The three splits decided by the preprocessing (dataset.json), one file
+    # The two splits decided by the preprocessing (dataset.json), one file
     # each: the same cubes and locations the diffusion model uses for its
-    # train / val / test. Nothing is split here.
+    # train / val. Nothing is split here.
     train_npy: str = "${.preprocessed_dir}/train_T${.T}.npy"
     val_npy: str = "${.preprocessed_dir}/val_T${.T}.npy"
-    test_npy: Optional[str] = "${.preprocessed_dir}/test_T${.T}.npy"    # null = no test evaluation
     # cubes and locations of each file, for training_info.json
     manifest: str = "${.preprocessed_dir}/manifest.json"
     dataset_json: str = "${.preprocessed_dir}/dataset.json"
@@ -279,7 +277,7 @@ class TemporalModuleCfg:
     num_attention_heads: int = 4
     attention_block_types: list[str] = field(default_factory=lambda: ["Temporal_Self"])
     temporal_position_encoding: bool = True
-    temporal_position_encoding_max_len: int = 40        # deve essere >= image_time_length
+    temporal_position_encoding_max_len: int = 40        # deve essere >= image_time_length + 1 (frame statico)
     temporal_attention_dim_div: int = 1
     zero_initialize: bool = True
     gradient_checkpoint: bool = True
@@ -570,6 +568,24 @@ class DiffusionCfg:
     channel_scale_factors: Optional[list[float]] = None
 
     disable_first_stage_autocast: bool = True
+    # Which pixels the diffusion loss (training, and the validation loss) is computed on:
+    #   "all":   every pixel, whatever the cloudiness
+    #   "valid": only the cloud-free pixels of the target frames, with the ENS rule
+    #            (ens.cloud_prob_threshold / ens.cloud_prob_scale, read from the original
+    #            .npz; ens.enabled is not needed). The loss lives in the latent space, so
+    #            the pixel mask is area-averaged to the latent resolution: every latent
+    #            cell weighs the fraction of its pixels that are valid.
+    loss_pixels: str = "all"
+    LOSS_PIXELS: ClassVar[tuple[str, ...]] = ("all", "valid")
+    # Which validation epoch is saved as checkpoints/best:
+    #   "rmse": lowest latter_rmse (RMSE on the last 10 of the 20 predicted frames)
+    #   "loss": lowest diffusion loss on the validation set (one extra forward pass per
+    #           validation batch: the training loss, but with the same sigmas and noises at
+    #           every validation and without condition dropout, so that two epochs are
+    #           compared on the same draws; see validation_loss)
+    #   "ens":  highest ENS on the validation set (needs ens.enabled and ens.validation)
+    save_best_by: str = "rmse"
+    SAVE_BEST_BY: ClassVar[tuple[str, ...]] = ("rmse", "loss", "ens")
     # pretrained_image_ckpt (non usato): checkpoints/sd_xl_base_1.0.safetensors
     # oppure checkpoints/768-v-ema.safetensors
     input_key: str = "imgs"
@@ -717,13 +733,63 @@ class AccelerateCfg:
     logging_steps: int = 500
 
     # Validazione ogni 10 epoche, sull'INTERO validation set (183 batch da 8 cubi):
-    # le quattro RMSE aggregate finiscono in logs/validation_metrics.log e il
-    # modello con il latter_rmse piu' basso in checkpoints/best-latter_rmse.
+    # le RMSE aggregate finiscono in history.csv e l'epoca scelta da diffusion.save_best_by
+    # (default: il latter_rmse piu' basso) in checkpoints/best.
     # L'ultima epoca viene sempre validata a prescindere dall'intervallo, cosi'
     # lo stato finale ha una misura e puo' aggiornare il best.
     # (portato a 5 per la coda di diffusion_v1, poi rimesso a 10)
     validate_epoch_interval: int = 10
     validate_batch_num: int = 10000
+
+
+# ================================================= ENS =================================================
+# Metriche EarthNet (ENS con MAD, OLS, EMD, SSIM, piu' SSIM_RAW, P-MAE e N-MAE) calcolate
+# durante il training di fase 2, le stesse di src/scripts/evaluate_ens.py (il codice sta
+# in src/utils/ens_metrics.py). Servono predizioni vere, cioe' il sampling completo:
+# per questo si fanno solo dove si fa gia' inferenza, non sui batch di training.
+# Ogni cubo e' predetto run.val_num_samples (K) volte e di ognuno si tiene la predizione
+# con l'ENS piu' alto (best-of-K). Le colonne finiscono in history.csv (val_ENS, ...,
+# train_ENS, ...) e nei grafici results/curves/ens*.png.
+
+@dataclass
+class EnsCfg:
+    enabled: bool = False                   # false = niente ENS (nessun costo)
+    validation: bool = True                 # ENS sul validation set, nelle epoche di validazione
+    train: bool = False                     # ENS anche su un campione di cubi di train
+    train_cubes: int = 100                  # quanti cubi di train per valutazione
+    train_every_epochs: int = 1             # ogni quante epoche (1 = a fine di ogni epoca)
+    # true = sempre gli stessi cubi (curve confrontabili tra epoche); false = un campione
+    # casuale nuovo a ogni valutazione
+    train_fixed_subset: bool = True
+    # 'fast' = MAD ed EMD vettorizzati di evaluate_ens.py (stesso numero), 'toolkit' = originali
+    scoring: str = "fast"
+    # data_range della SSIM: 2.0 e' quello con cui sono calibrati i punteggi pubblicati
+    ssim_data_range: float = 2.0
+    # true = i pixel nuvolosi sono esclusi dal confronto, come nello scoring ufficiale
+    # (la maschera si legge dai .npz originali, il modello non la vede); false = tutti i pixel
+    cloud_mask: bool = True
+    cloud_prob_threshold: float = 0.20      # sotto questa probabilita' di nuvola un pixel e' valido
+    cloud_prob_scale: float = 100.0         # fondo scala del canale (EarthNet la da' in %)
+
+    SCORING_MODES: ClassVar[tuple[str, ...]] = ("fast", "toolkit")
+
+
+# ============================================== TEST EVAL ==============================================
+# Valutazione sui test set EarthNet a fine training di fase 2: finito il training loop si
+# chiama src/scripts/evaluate_ens.py sugli split indicati, sul checkpoint scelto. I file
+# finiscono dove li metterebbe lo script lanciato a mano:
+# <run>/results/statistics/metrics_results_<split>_K_<K>.{json,csv}.
+# Un errore qui (es. cartella di uno split mancante) non fa fallire il run: il training e'
+# gia' finito e i checkpoint salvati, si rilancia evaluate_ens.py a mano.
+
+@dataclass
+class TestEvalCfg:
+    enabled: bool = True                    # false = niente valutazione a fine training
+    splits: list[str] = field(default_factory=lambda: ["iid", "ood", "extreme", "seasonal"])
+    checkpoint: str = "best"                # best | latest | nome di una cartella di checkpoints/
+    num_samples: Optional[int] = None       # K predizioni per cubo; null = run.val_num_samples
+    subset: int = 0                         # 0 = tutti i cubi; N = N cubi a caso (giro di prova)
+    seed: int = 42                          # seed del sampling e del rumore di OLS
 
 
 # ================================================ WANDB ================================================
@@ -759,6 +825,8 @@ class TrainCfg:
     diffusion: DiffusionCfg = field(default_factory=DiffusionCfg)
     data: DataCfg = field(default_factory=DataCfg)
     accelerate: AccelerateCfg = field(default_factory=AccelerateCfg)
+    ens: EnsCfg = field(default_factory=EnsCfg)
+    test_eval: TestEvalCfg = field(default_factory=TestEvalCfg)
     wandb: WandbCfg = field(default_factory=WandbCfg)
 
 
@@ -781,23 +849,65 @@ def _set_first_stage_schema(cfg: DictConfig, fs_type: Optional[str]) -> None:
     cfg.diffusion.first_stage_config = FIRST_STAGE_SCHEMAS[fs_type]()
 
 
-def load_config(*paths: Union[str, Path], overrides: Optional[list[str]] = None) -> TrainCfg:
+def known_keys_only(saved: dict, schema: Any, prefix: str = "") -> tuple[dict, list[str]]:
+    """
+    The keys of a saved config that `schema` (a DictConfig) still has. A run saved
+    before a key was removed (e.g. run.workdir, preprocessing.test_frac) would otherwise
+    not reload. Returns (filtered config, dropped keys).
+    """
+    kept, dropped = {}, []
+    for key, value in saved.items():
+        if key not in schema:
+            dropped.append(prefix + key)
+        elif isinstance(value, dict) and OmegaConf.is_dict(schema[key]):
+            kept[key], inner = known_keys_only(value, schema[key], prefix + key + ".")
+            dropped += inner
+        else:
+            kept[key] = value
+    return kept, dropped
+
+
+def load_config(*paths: Union[str, Path], overrides: Optional[list[str]] = None,
+                drop_unknown: bool = False) -> TrainCfg:
     """
     Schema TrainCfg <- yaml in `paths` (da sinistra a destra) <- `overrides` in
     dotlist (es. ["diffusion.scale_factor=0.2"]), poi validate_config().
+
+    drop_unknown=True ignora (con un avviso) le chiavi dei yaml che lo schema non ha
+    piu': serve per rileggere il config salvato da un run vecchio (vedi
+    load_saved_config). Per i config che si scrivono a mano resta False: li' una chiave
+    sconosciuta e' quasi sempre un refuso, e deve fermare il lancio.
     """
     sources = [OmegaConf.load(p) for p in paths]
-    if overrides:
-        sources.append(OmegaConf.from_dotlist(list(overrides)))
+    override_sources = [OmegaConf.from_dotlist(list(overrides))] if overrides else []
 
     cfg = OmegaConf.structured(TrainCfg)
     # la variante del first stage va scelta PRIMA del merge (vince l'ultima sorgente)
-    for src in sources:
+    for src in sources + override_sources:
         _set_first_stage_schema(cfg, OmegaConf.select(src, _FIRST_STAGE_TYPE_KEY))
-    cfg = OmegaConf.merge(cfg, *sources)
+    if drop_unknown:
+        # solo i file: gli override sono scritti a mano, un refuso li' deve fallire
+        filtered = []
+        for path, src in zip(paths, sources):
+            kept, dropped = known_keys_only(OmegaConf.to_container(src), cfg)
+            if dropped:
+                print(f"[config] {path}: chiavi non piu' nello schema, ignorate: {dropped}")
+            filtered.append(OmegaConf.create(kept))
+        sources = filtered
+    cfg = OmegaConf.merge(cfg, *sources, *override_sources)
 
     validate_config(cfg)
     return cfg  # type: ignore[return-value]
+
+
+def load_saved_config(path: Union[str, Path]) -> TrainCfg:
+    """
+    artifacts/config.yaml di un run, riletto con lo schema ATTUALE. Un run salvato prima
+    che una chiave venisse tolta (preprocessing.test_frac e autoencoder.test_npy sono
+    spariti con lo split di test del preprocessing) non si caricherebbe nello schema
+    tipizzato: quelle chiavi si ignorano con un avviso, il resto resta com'e' stato salvato.
+    """
+    return load_config(path, drop_unknown=True)
 
 
 def _merge_into(cfg: TrainCfg, source: DictConfig) -> TrainCfg:
@@ -1049,6 +1159,7 @@ def validate_config(cfg: TrainCfg) -> None:
         "diffusion.denoiser_config.params.weighting_config.params.mode": ("min", "max"),
         _FIRST_STAGE_TYPE_KEY: tuple(FIRST_STAGE_SCHEMAS),
         "autoencoder.save_best_by": ("loss", "mse", "psnr", "ssim"),
+        "diffusion.save_best_by": DiffusionCfg.SAVE_BEST_BY,
         "data.params.meso_agg": ("last", "first", "mean", "sum"),
         "data.params.meso_time_span": ("all", "future"),
     }
@@ -1092,9 +1203,9 @@ def validate_config(cfg: TrainCfg) -> None:
     pre = cfg.preprocessing
     if pre.limit < 0:
         errors.append(f"preprocessing.limit={pre.limit} must be >= 0 (0 = all the cubes)")
-    if pre.val_frac < 0 or pre.test_frac < 0 or pre.val_frac + pre.test_frac >= 1:
-        errors.append(f"preprocessing.val_frac={pre.val_frac} and test_frac={pre.test_frac} "
-                      f"must be >= 0 and leave locations for train (sum < 1)")
+    if pre.val_frac < 0 or pre.val_frac >= 1:
+        errors.append(f"preprocessing.val_frac={pre.val_frac} must be >= 0 and < 1 "
+                      f"(locations are left for train)")
     if pre.val_frac <= 0:
         errors.append("preprocessing.val_frac must be > 0: both phases validate on that split")
     if pre.dtype not in ("float16", "float32"):
@@ -1140,6 +1251,33 @@ def validate_config(cfg: TrainCfg) -> None:
                 errors.append(f"diffusion.{key} is only used with latent_normalization="
                               f"'shift_scale_per_channel': leave it null")
 
+    if cfg.diffusion.loss_pixels not in DiffusionCfg.LOSS_PIXELS:
+        errors.append(f"diffusion.loss_pixels={cfg.diffusion.loss_pixels!r} must be one of "
+                      f"{DiffusionCfg.LOSS_PIXELS}")
+
+    ens = cfg.ens
+    if ens.scoring not in EnsCfg.SCORING_MODES:
+        errors.append(f"ens.scoring={ens.scoring!r} must be one of {EnsCfg.SCORING_MODES}")
+    if ens.enabled and not (ens.validation or ens.train):
+        errors.append("ens.enabled=true but ens.validation and ens.train are both false: "
+                      "nothing would be computed")
+    if cfg.diffusion.save_best_by == "ens" and not (ens.enabled and ens.validation):
+        errors.append("diffusion.save_best_by=ens needs ens.enabled=true and ens.validation=true")
+    if ens.train and (ens.train_cubes < 1 or ens.train_every_epochs < 1):
+        errors.append("ens.train_cubes and ens.train_every_epochs must be >= 1")
+    if ens.enabled and cfg.run.val_num_samples < 1:
+        errors.append("run.val_num_samples must be >= 1")
+    test_eval = cfg.test_eval
+    if test_eval.enabled:
+        known = ("iid", "ood", "extreme", "seasonal", "train", "val")
+        bad = [s for s in test_eval.splits if s.lower().removesuffix("_test_split") not in known]
+        if not test_eval.splits or bad:
+            errors.append(f"test_eval.splits={list(test_eval.splits)} must be a non-empty list "
+                          f"of {known} (unknown: {bad})")
+        if test_eval.num_samples is not None and test_eval.num_samples < 1:
+            errors.append("test_eval.num_samples must be >= 1 (or null)")
+        if test_eval.subset < 0:
+            errors.append("test_eval.subset must be >= 0")
     if cfg.autoencoder.early_stopping_patience < 0 or cfg.autoencoder.early_stopping_min_delta < 0:
         errors.append("autoencoder.early_stopping_patience and "
                       "autoencoder.early_stopping_min_delta must be >= 0")
@@ -1159,8 +1297,10 @@ def validate_config(cfg: TrainCfg) -> None:
         errors.append(f"input_size={dit.input_size} del DiT non divisibile per "
                       f"patch_size={dit.patch_size}")
     max_len = dit.temporal_module_kwargs.temporal_position_encoding_max_len
-    if dit.image_time_length > max_len:
-        errors.append(f"image_time_length={dit.image_time_length} supera "
+    # la variabile statica si aggiunge come frame alla sequenza dell'attenzione temporale
+    # (Attention.forward in DiT.py): servono image_time_length + 1 posizioni
+    if dit.image_time_length + 1 > max_len:
+        errors.append(f"image_time_length={dit.image_time_length} + 1 (il frame statico) supera "
                       f"temporal_position_encoding_max_len={max_len}")
     if data.meso_time_span != "all":
         errors.append("data.params.meso_time_span deve essere 'all': climate_var del DiT "

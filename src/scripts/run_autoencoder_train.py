@@ -16,7 +16,7 @@ from src.training.tracking import start_tracker
 from src.training.train_autoencoder import (configure_train, describe_run,
                                             instantiate_autoencoder, mark_run_ended,
                                             measure_scale_factor, prepare_training,
-                                            setup_dataloader, test_vae, train_vae)
+                                            setup_dataloader, train_vae)
 
 # Lancio dall'IDE (Run/Debug, che non passa argomenti): valgono questi. Da
 # terminale --cfgdir e --project_name li scavalcano, e config_from_cli scrive a
@@ -52,7 +52,7 @@ def main(config_file=DEFAULT_CONFIG_FILE,
                                outputs,
                                "autoencoder")
 
-    # Training Loop + test of the best checkpoint + scale factor
+    # Training Loop + scale factor
     try:
         train_vae(cfg,
                   rt,
@@ -62,12 +62,6 @@ def main(config_file=DEFAULT_CONFIG_FILE,
                   optimizer,
                   scheduler,
                   loaders)
-        test_vae(cfg,
-                 rt,
-                 outputs,
-                 state,
-                 vae,
-                 loaders)
         # diffusion.scale_factor of the best weights, saved in best.pt for phase 2
         measure_scale_factor(cfg,
                              rt,

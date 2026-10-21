@@ -125,7 +125,6 @@ def file_composition(npy_path,
 
 def make_dataloaders(train_npy,
                      val_npy,
-                     test_npy=None,
                      manifest=None,
                      batch_size=32,
                      num_workers=4,
@@ -133,17 +132,15 @@ def make_dataloaders(train_npy,
                      persistent_workers=True,
                      pin_memory=True):
     """
-    Costruisce i DataLoader sui tre file scritti dal preprocessing, uno per
+    Costruisce i DataLoader sui due file scritti dal preprocessing, uno per
     split: the split is decided there (dataset.json), nothing is split here.
 
-    test_npy=None skips the test set.
-
-    Returns (loaders, composition): loaders is {"train", "val", "test"} (test
-    is None without test_npy), composition holds images, cubes and locations
-    of each split, plus the file each split comes from.
+    Returns (loaders, composition): loaders is {"train", "val"}, composition
+    holds images, cubes and locations of each split, plus the file each split
+    comes from.
     """
-    for name, path in (("train", train_npy), ("val", val_npy), ("test", test_npy)):
-        if path is not None and not Path(path).is_file():
+    for name, path in (("train", train_npy), ("val", val_npy)):
+        if not Path(path).is_file():
             raise FileNotFoundError(
                 f"{name} split not found: {path}. Run src/dataset/preprocessing.py "
                 f"with the same configuration (without --stats-only: phase 1 needs the .npy files)."
@@ -162,24 +159,13 @@ def make_dataloaders(train_npy,
     composition["train"]["source"] = str(train_npy)
     composition["val"]["source"] = str(val_npy)
 
-    test_ds = None
-    if test_npy is not None:
-        test_ds = S2FlatDataset(test_npy)
-        composition["test"] = file_composition(test_npy,
-                                               test_ds,
-                                               manifest)
-        composition["test"]["source"] = str(test_npy)
-
-    for name, ds in (("val", val_ds), ("test", test_ds)):
-        if ds is None:
-            continue
-        if ds.n_channels != train_ds.n_channels:
-            raise ValueError(
-                f"train e {name} hanno un numero di bande diverso: "
-                f"{train_ds.n_channels} vs {ds.n_channels}"
-            )
-        if len(ds) == 0:
-            raise ValueError(f"il set di {name} e' vuoto")
+    if val_ds.n_channels != train_ds.n_channels:
+        raise ValueError(
+            f"train e val hanno un numero di bande diverso: "
+            f"{train_ds.n_channels} vs {val_ds.n_channels}"
+        )
+    if len(val_ds) == 0:
+        raise ValueError("il set di val e' vuoto")
 
     common = dict(
         num_workers=num_workers,
@@ -199,17 +185,10 @@ def make_dataloaders(train_npy,
                           shuffle=False,
                           drop_last=False,
                           **common),
-        "test": None if test_ds is None else DataLoader(test_ds,
-                                                        batch_size=batch_size,
-                                                        shuffle=False,
-                                                        drop_last=False,
-                                                        **common),
     }
 
     print(f"Train: {len(train_ds)} immagini {train_ds.image_size}, "
           f"{train_ds.n_channels} bande, {len(loaders['train'])} batch")
     print(f"Val  : {len(val_ds)} immagini, {len(loaders['val'])} batch")
-    if test_ds is not None:
-        print(f"Test : {len(test_ds)} immagini, {len(loaders['test'])} batch")
 
     return loaders, composition
