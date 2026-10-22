@@ -82,19 +82,21 @@ class Tracker:
                 continue
             self._synced.add(str(relative))
             new_dirs.add(path.parent)
-            # only the examples folder itself: final/ holds one PNG per val cube
-            if path.suffix == ".png" and path.parent == examples:
+            # only the figures of the epochs (epoch_XXX/, epochs_XXX/): the per-band PNGs of the
+            # final export (val/, iid/, ...) have a cube per folder and would flood the report
+            if (path.suffix == ".png" and examples in path.parents
+                    and path.relative_to(examples).parts[0].startswith("epoch")):
                 new_images.append(path)
         if self.cfg.wandb.upload_files:
             # one save per folder with new files (wandb prints a line per call);
             # files already uploaded match again and are simply kept. "*.*"
-            # matches the files but not the subfolders (e.g. forecasts/final)
+            # matches the files but not the subfolders (each folder with new files is saved)
             for folder in sorted(new_dirs):
                 self.run.save(str(folder / "*.*"),
                               base_path=str(root),
                               policy="live")
         if new_images and self.cfg.wandb.log_images:
-            self.run.log({examples.name: [wandb.Image(str(p), caption=p.name) for p in new_images]},
+            self.run.log({examples.name: [wandb.Image(str(p), caption=str(p.relative_to(examples))) for p in new_images]},
                          step=step)
 
     def finish(self,

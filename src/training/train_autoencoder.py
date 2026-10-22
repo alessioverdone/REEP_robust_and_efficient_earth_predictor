@@ -18,12 +18,13 @@ import logging
 import os
 import time
 import traceback
+from pathlib import Path
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
-from src.dataset.S2FlatDataset import make_dataloaders
+from src.dataset.S2FlatDataset import locate_rows, make_dataloaders
 from src.dataset.dataset_info import dataset_identity, load_dataset_info
 from src.model.autoencoder_utils import (append_history_row, compute_batch_psnr,
                                          compute_ssim_torch, get_vae, load_checkpoint,
@@ -32,7 +33,8 @@ from src.model.autoencoder_utils import (append_history_row, compute_batch_psnr,
 from src.training.run_outputs import (count_parameters, environment_info, file_size_mb,
                                       measure_flops, relative_to_project, write_json)
 from src.training.state import AutoencoderState, monitored_value
-from src.utils.plots import plot_history, save_reconstruction_grid
+from src.utils.ens_metrics import load_cloud_frames
+from src.utils.plots import plot_history, save_band_grids
 
 logger = logging.getLogger(__name__)
 
@@ -454,35 +456,101 @@ def evaluate_vae(cfg, rt, vae, dataloader, desc="Validation"):
     }, n_samples
 
 
-def example_batch(dataset,
-                  n):
-    """n images evenly spread over the dataset, always the same ones."""
+def build_examples(cfg,
+                   loaders):
+    """
+    The validation images of the reconstruction figures: autoencoder.n_recon_examples rows
+    of the val split drawn once at random (fixed seed), so every epoch shows the same ones.
+    Returns None without examples, otherwise
+
+        imgs    (N, C, H, W) at the training resolution, in [-1, 1]
+        prob    (N, H, W) cloud probability in [0, 1], at the same resolution
+        titles  tile and time index of each image
+
+    The cloud probability is not in the .npy the autoencoder works on, so it is read from the
+    original .npz: manifest.json says which cube and time index each row of the .npy is.
+    Where it cannot be found the row is NaN (grey in the figure).
+    """
+    auto = cfg.autoencoder
+    dataset = loaders["val"].dataset
+    n = min(auto.n_recon_examples, len(dataset))
     if n == 0:
         return None
-    indices = np.linspace(0, len(dataset) - 1, num=min(n, len(dataset))).astype(int)
-    return torch.stack([dataset[int(i)]["tif"] for i in indices])
+    rng = np.random.RandomState(cfg.run.seed)
+    rows = np.sort(rng.choice(len(dataset), size=n, replace=False))
+    imgs = resize_images(torch.stack([dataset[int(i)]["tif"] for i in rows]),
+                         auto.image_size)
+
+    titles = [f"image {i}" for i in rows]
+    prob = np.full((n, auto.image_size, auto.image_size), np.nan, dtype=np.float32)
+    try:
+        located = locate_rows(auto.manifest, auto.val_npy, rows)
+    except (OSError, KeyError, ValueError) as error:
+        logger.warning(f"[autoencoder] cloud probability of the examples not available "
+                       f"({error}): the row is left grey")
+        return {"imgs": imgs, "prob": prob, "titles": titles}
+
+    for k, (path, frame) in enumerate(located):
+        titles[k] = f"{Path(path).stem.split('_')[0]}\nframe {frame}"
+        try:
+            prob[k] = load_cloud_frames(path,
+                                        [frame],
+                                        cfg.ens.cloud_prob_threshold,
+                                        cfg.ens.cloud_prob_scale,
+                                        auto.image_size)[0][0]
+        except (OSError, KeyError, IndexError, ValueError) as error:
+            logger.warning(f"[autoencoder] cloud probability of {path} frame {frame} not "
+                           f"readable ({error}): left grey")
+    return {"imgs": imgs, "prob": prob, "titles": titles}
 
 
 @torch.no_grad()
-def save_examples(cfg,
-                  rt,
+def save_examples(rt,
                   vae,
-                  imgs,
-                  path,
+                  examples,
+                  folder,
                   title):
-    """Reconstruction grid of `imgs` (input | recon | error), see save_reconstruction_grid."""
-    if imgs is None:
+    """
+    <folder>/<band>.png for each band, see plots.save_band_grids: a column per example,
+    rows ground truth, reconstruction, cloud probability and |error| / 2 (the error is on
+    every pixel, clouds included, as in the loss).
+    """
+    if examples is None:
         return
     was_training = vae.training
     vae.eval()
-    imgs = resize_images(imgs.to(rt.device),
-                         cfg.autoencoder.image_size)
+    imgs = examples["imgs"].to(rt.device)
     recon = vae.decode(vae.encode(imgs).latent_dist.mean).sample
-    save_reconstruction_grid(imgs.float().cpu().numpy(),
-                             recon.float().clamp(-1, 1).cpu().numpy(),
-                             path,
-                             title=title)
+    save_band_grids(imgs.float().cpu().numpy(),
+                    recon.float().clamp(-1, 1).cpu().numpy(),
+                    examples["prob"],
+                    folder,
+                    examples["titles"],
+                    pred_label="reconstruction",
+                    title=title)
     vae.train(was_training)
+
+
+def save_final_examples(rt,
+                        outputs,
+                        state,
+                        vae,
+                        examples):
+    """The same figures with the best weights, in results/reconstructions/final/."""
+    if examples is None:
+        return
+    if state.best_state_dict is not None:
+        vae.load_state_dict(state.best_state_dict)
+        label = f"best weights, epoch {state.best_epoch}"
+    else:
+        label = "last weights"
+    save_examples(rt,
+                  vae,
+                  examples,
+                  os.path.join(outputs.examples, "final"),
+                  title=f"validation, {label}")
+    logger.info(f"[autoencoder] final reconstruction figures in "
+                f"{os.path.join(outputs.examples, 'final')}")
 
 
 def _checkpoint_extra(cfg, state, train_metrics, val_metrics):
@@ -563,17 +631,16 @@ def train_vae(cfg,
               vae,
               optimizer,
               scheduler,
-              loaders):
+              loaders,
+              examples=None):
     """
     Il loop di training. Fa avanzare `state` (epoca, step, miglior metrica e
     metriche in state.metrics) come train_loop() fa con TrainState nella fase 2.
     After every epoch: history.csv, checkpoints, curves, training_info.json,
-    and every examples_every epochs the reconstruction examples.
+    and every examples_every epochs the reconstruction figures (results/reconstructions/epochs_XXX/).
     """
     auto = cfg.autoencoder
     data_range = auto.data_range
-    val_examples = example_batch(loaders["val"].dataset,
-                                 auto.n_recon_examples)
     write_training_info(cfg,
                         outputs,
                         state,
@@ -711,11 +778,10 @@ def train_vae(cfg,
                                      vae, optimizer, scheduler, epoch, extra)
 
         if auto.examples_every and (epoch + 1) % auto.examples_every == 0:
-            save_examples(cfg,
-                          rt,
+            save_examples(rt,
                           vae,
-                          val_examples,
-                          os.path.join(outputs.examples, f"val_epoch_{epoch + 1:03d}.png"),
+                          examples,
+                          os.path.join(outputs.examples, f"epochs_{epoch + 1:03d}"),
                           title=f"validation, epoch {epoch + 1}")
 
         update_figures(outputs,

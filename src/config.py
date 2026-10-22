@@ -97,7 +97,6 @@ class RunCfg:
     validate_only: bool = False                         # solo una validazione dal checkpoint, niente training
     scale_lr: bool = False                              # vedi effective_learning_rate()
     allow_tf32: bool = True
-    save_val_images_max: int = 0                        # cap on the per-cube PNGs of the final validation, 0 = all
     set: list[str] = field(default_factory=list)        # override in dotlist, applicati per ultimi
     show_debug_log: bool = False                        # verbose log
 
@@ -231,9 +230,12 @@ class AutoencoderCfg:
     # disk (quick experiments): the test then uses the best weights kept in memory
     save_checkpoints: bool = True
     resume_from: Optional[str] = None
-    # reconstruction examples saved in results/reconstructions/
-    n_recon_examples: int = 8
-    examples_every: int = 5                 # epochs; 0 = only at the end (test)
+    # Reconstruction examples, one PNG per band (ground truth, reconstruction, cloud
+    # probability, error): n_recon_examples validation images drawn once at random (always
+    # the same ones), in results/reconstructions/epochs_XXX/ every examples_every epochs and
+    # in results/reconstructions/final/ with the best weights.
+    n_recon_examples: int = 8               # 0 = no figures
+    examples_every: int = 5                 # epochs; 0 = only the final ones
 
     # ottimizzazione
     grad_clip_norm: float = 1.0
@@ -605,13 +607,12 @@ class DiffusionCfg:
     # Outputs: every run writes ONLY into <outputs_dir>/<start timestamp>/
     # (artifacts/, checkpoints/, results/), see src/training/run_outputs.py.
     outputs_dir: str = "${paths.outputs_dir}/diffusion"
-    # results/forecasts/val_epoch_XXX.png at every validation: this many
-    # validation cubes (always the same ones), each shown at
-    # forecast_lead_columns lead times evenly spread over the predicted frames.
-    # 0 = no figure. The final validation also writes one PNG per cube
-    # (run.save_val_images_max) in results/forecasts/final/.
+    # Forecast examples at every validation: this many validation cubes, drawn once at
+    # random (always the same ones), in results/forecasts/epoch_XXX/<cube>/<band>.png: one
+    # PNG per band, a column per predicted frame; rows ground truth, prediction, cloud
+    # probability and error. At the end of the training the same cubes are written in
+    # results/forecasts/val/ with the BEST checkpoint (one more inference). 0 = no figures.
     n_forecast_examples: int = 4
-    forecast_lead_columns: int = 5
 
     # Accumulatori della validazione.
     # mean_k_se / best_k_se: valutazione a K campioni (--val_num_samples).
@@ -789,6 +790,9 @@ class TestEvalCfg:
     checkpoint: str = "best"                # best | latest | nome di una cartella di checkpoints/
     num_samples: Optional[int] = None       # K predizioni per cubo; null = run.val_num_samples
     subset: int = 0                         # 0 = tutti i cubi; N = N cubi a caso (giro di prova)
+    # per split: N cubi (sempre gli stessi) di cui si salvano le figure per banda, in
+    # <run>/results/forecasts/<split>/<cubo>/<banda>.png; 0 = nessuna
+    export_cubes: int = 4
     seed: int = 42                          # seed del sampling e del rumore di OLS
 
 
@@ -1065,10 +1069,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="TF32 sulle GPU Ampere: piu' veloce, meno preciso "
              f"(default: {RunCfg.allow_tf32})")
     parser.add_argument(
-        "--save_val_images_max", type=int, default=None,
-        help="cap on the per-cube PNGs saved in results/forecasts/final/ by "
-             "the last validation (0 = every validation cube)")
-    parser.add_argument(
         "--set", nargs="*", default=None, metavar="CHIAVE=VALORE",
         help="override del config in notazione dotlist, applicati DOPO i yaml "
              "di --cfgdir. Esempio: --set accelerate.weight_dtype=float32 "
@@ -1278,12 +1278,13 @@ def validate_config(cfg: TrainCfg) -> None:
             errors.append("test_eval.num_samples must be >= 1 (or null)")
         if test_eval.subset < 0:
             errors.append("test_eval.subset must be >= 0")
+        if test_eval.export_cubes < 0:
+            errors.append("test_eval.export_cubes must be >= 0")
     if cfg.autoencoder.early_stopping_patience < 0 or cfg.autoencoder.early_stopping_min_delta < 0:
         errors.append("autoencoder.early_stopping_patience and "
                       "autoencoder.early_stopping_min_delta must be >= 0")
-    if cfg.diffusion.n_forecast_examples < 0 or cfg.diffusion.forecast_lead_columns < 1:
-        errors.append("diffusion.n_forecast_examples must be >= 0 and "
-                      "diffusion.forecast_lead_columns >= 1")
+    if cfg.diffusion.n_forecast_examples < 0:
+        errors.append("diffusion.n_forecast_examples must be >= 0")
     if cfg.autoencoder.n_recon_examples < 0 or cfg.autoencoder.examples_every < 0:
         errors.append("autoencoder.n_recon_examples and autoencoder.examples_every "
                       "must be >= 0")

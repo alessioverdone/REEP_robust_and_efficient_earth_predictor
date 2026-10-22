@@ -1,0 +1,277 @@
+# QUICK TEST: the whole pipeline in a few minutes, only to see that everything works
+# (dataset, both trainings, per-band figures, test evaluation). The numbers mean nothing.
+# Copy of configuration_0.yaml with: 40 cubes, tiny models, 2 epochs, 32x32 images
+# (data.params.resize), batch 2, no workers, 5 sampling steps, 3 test cubes.
+# It has its own dataset folder (data/preprocessed/n40_s0), so it does not touch the real one.
+#
+#   python src/dataset/preprocessing.py --cfgdir quick_test.yaml
+#   python src/scripts/run_autoencoder_train.py --cfgdir quick_test.yaml
+#   python src/scripts/run_diffusion_train.py --cfgdir quick_test.yaml
+#
+# Phase 2 picks the VAE of the last autoencoder run on this dataset (pretrained_path: latest).
+
+run:
+  project_name: quick_test
+  cfgdir: []
+  seed: 42
+  resume_from_checkpoint: null   # null = new training; a checkpoint-<step> folder, or latest (same project_name)
+  val_num_samples: 1
+  validate_only: false
+  scale_lr: false
+  allow_tf32: true
+  set: []
+  show_debug_log: false
+
+# Le cartelle del progetto, relative alla sua root. Tutto il resto del config le
+# interpola da qui: data/raw in sola lettura, data/preprocessed/<preprocessing.name>
+# per tutto quello che produce src/dataset/preprocessing.py (un giro solo serve
+# le due fasi).
+paths:
+  raw_dir: data/raw/train
+  # preprocessed_dir is derived: data/preprocessed/${preprocessing.name}
+  checkpoints_dir: registry/checkpoints   # checkpoints promoted by hand
+  outputs_dir: registry/outputs           # one timestamped folder per run
+
+# The only place where cubes are selected and split (train / val by
+# location): both phases read the result from <preprocessed_dir>/dataset.json.
+preprocessing:
+  # name: n${.limit}_s${.seed}     (default, the folder under data/preprocessed/)
+  limit: 40                   # 0 = all the cubes
+  limit_after_drop: true      # true = `limit` counts the cubes left after dropping the bad ones
+  val_frac: 0.25
+  seed: 0
+  times: [10]                 # .npy files for the autoencoder; must contain autoencoder.T
+  dtype: float16
+  drop_threshold: 0.5
+  keep_empty_frame_cubes: false
+  drop_static_nan_frac: null
+  range_sample: 256
+  workers: 4
+  chunk: 16
+
+autoencoder:
+  # preprocessed_dir, outputs_dir, image_size (= data.params.resize) and the
+  # train/val .npy files are derived: the splits come from the preprocessing
+  T: 10
+  batch_size: 8
+  num_workers: 2
+  num_epochs: 2
+  lr: 1e-3
+  block_out_channels: [32, 64, 128]
+  layers_per_block: 2
+  norm_num_groups: 32
+  latent_channels: 4
+  # name in paths.checkpoints_dir of the VAE that phase 2 loads by default
+  # (copied there by hand from a run's checkpoints/best.pt)
+  save_path: vae_s2_T${.T}_best.pth
+  save_checkpoints: true          # only best.pt and last.pt
+  resume_from: null
+  n_recon_examples: 4         # validation images in results/reconstructions/epochs_XXX/ and final/, 0 = none
+  examples_every: 1           # epochs; 0 = only final/
+  grad_clip_norm: 1.0
+  weight_decay: 1e-4
+  save_best_by: loss
+  lr_scheduler_factor: 0.5
+  lr_scheduler_patience: 5
+  # stop after this many epochs without improving val_<save_best_by> by more than min_delta (0 = off)
+  early_stopping_patience: 0
+  early_stopping_min_delta: 0.0
+  data_range: 2.0
+  scale_factor_batches: 5     # batches used to measure diffusion.scale_factor / shift_factor at the end
+  prefetch_factor: 2
+  persistent_workers: false
+
+diffusion:
+  scale_factor: null          # null = read from the VAE checkpoint (measured by phase 1)
+  # shift_scale:             z = (z_vae - shift_factor) * scale_factor
+  # shift_scale_per_channel: the same with one shift/scale per latent channel (channel_*_factors)
+  # scale:                   z = z_vae * scale_factor (formula used before 2026-10-08)
+  latent_normalization: shift_scale
+  shift_factor: null          # null = read from the VAE checkpoint; must stay null with 'scale'
+  channel_shift_factors: null # shift_scale_per_channel only; null = read from the VAE checkpoint
+  channel_scale_factors: null
+  disable_first_stage_autocast: true
+  loss_pixels: all            # pixels of the diffusion loss: all (every pixel) | valid (only the cloud-free ones of the target frames, same rule as the ENS: ens.cloud_prob_threshold / cloud_prob_scale)
+  save_best_by: rmse         # epoch kept as checkpoints/best: rmse (lowest val latter_rmse) | loss (lowest val loss, same draws at every validation) | ens (highest val ENS, needs ens.enabled)
+  input_key: imgs
+  log_keys: [txt]
+  # outputs_dir is derived: ${paths.outputs_dir}/diffusion (one folder per run)
+  n_forecast_examples: 2      # validation cubes in results/forecasts/epoch_XXX/<cube>/ (and val/ at the end, best checkpoint), 0 = none
+
+  network_config:
+    target: sgm.modules.diffusionmodules.models.DiT.DiT
+    params:
+      depth: 2
+      hidden_size: 64
+      patch_size: 2
+      num_heads: 4
+      learn_sigma: false
+      use_checkpoint: true
+      static_channel: 1
+      time_embed_repeat: repeat
+      temporal_module_kwargs:
+        num_attention_heads: 4
+        attention_block_types: [Temporal_Self]
+        temporal_position_encoding: true
+        temporal_position_encoding_max_len: 40
+        temporal_attention_dim_div: 1
+        zero_initialize: true
+        gradient_checkpoint: false
+  network_wrapper: sgm.modules.diffusionmodules.wrappers.DiTWrapper
+  compile_model: false
+
+  conditioner_config:
+    target: sgm.modules.GeneralConditioner
+    params:
+      emb_models:
+        - is_trainable: true
+          input_key: meso_condition_image
+          ucg_rate: 0.1
+          target: sgm.modules.encoders.modules.Identify_Mapping
+          params:
+            param1: true
+        - is_trainable: true
+          input_key: highres_condition_image
+          ucg_rate: 0.1
+          target: sgm.modules.encoders.modules.Identify_Mapping
+          params:
+            param1: true
+
+  first_stage_config:
+    type: vae
+    # params (latent_channels, block_out_channels, layers_per_block,
+    # norm_num_groups) sono DERIVATI dalla sezione autoencoder: e' la stessa
+    # architettura con cui la fase 1 ha addestrato il VAE, quindi non si
+    # riscrive qui.
+    # latest = best.pt of the most recent autoencoder run trained on this
+    # dataset (same dataset id) at this resolution. Or an explicit path, e.g.
+    # registry/outputs/autoencoder/<run>/checkpoints/best.pt
+    pretrained_path: latest
+  denoiser_config:
+    target: sgm.modules.diffusionmodules.denoiser.DiscreteDenoiser
+    params:
+      num_idx: 1000
+      weighting_config:
+        target: sgm.modules.diffusionmodules.denoiser_weighting.MinSNRWeight
+        params:
+          gamma: 5.0
+          mode: min
+      scaling_config:
+        target: sgm.modules.diffusionmodules.denoiser_scaling.EpsScaling
+      discretization_config:
+        target: sgm.modules.diffusionmodules.discretizer.LegacyDDPMDiscretization
+
+  loss_fn_config:
+    target: sgm.modules.diffusionmodules.loss.StandardDiffusionLoss
+    params:
+      past_weight: 0.1
+      sigma_sampler_config:
+        target: sgm.modules.diffusionmodules.sigma_sampling.DiscreteSampling
+        params:
+          num_idx: 1000
+          discretization_config:
+            target: sgm.modules.diffusionmodules.discretizer.LegacyDDPMDiscretization
+
+  sampler_config:
+    target: sgm.modules.diffusionmodules.sampling.EulerEDMSampler
+    params:
+      num_steps: 5
+      discretization_config:
+        target: sgm.modules.diffusionmodules.discretizer.LegacyDDPMDiscretization
+      guider_config:
+        target: sgm.modules.diffusionmodules.guiders.VanillaCFG
+        params:
+          scale: 2.0
+
+data:
+  target: src.dataset.dataloader_s2_dif.S2TemporalDataModule
+  params:
+    # data_root, dataset_json, stats_json and cond_stats_json are derived from paths
+    stats_time_key: "10"
+    T: 30
+    noise_image_num: 20
+    n_channels: 4
+    resize: 32
+    meso_channels: 5
+    meso_steps_per_frame: 5
+    meso_center_crop: 2
+    meso_agg: last
+    meso_time_span: all
+    batch_size: 2
+    num_workers: 2
+    shuffle: true
+    do_hflip: true
+    stats_workers: 0
+    dtype: float16
+
+accelerate:
+  gradient_accumulation_steps: 1
+  mixed_precision: bf16
+  weight_dtype: auto
+  num_train_epochs: 2
+  max_train_steps: null
+  learning_rate: 2e-4
+  learning_rate_base_batch_size: 16
+  max_grad_norm: 1.0
+  optimizer:
+    target: torch.optim.AdamW
+    params:
+      betas: ${tuple:0.9, 0.999}
+      weight_decay: 0.01
+      eps: 1e-8
+  lr_scheduler: constant
+  lr_warmup_steps: 0
+  checkpointing_epochs: false
+  checkpointing_steps: 100000000
+  checkpointing_steps_list: []
+  checkpoints_total_limit: 50
+  logging_steps: 10
+  validate_epoch_interval: 1
+  validate_batch_num: 2
+
+# EarthNet metrics during the diffusion training (phase 2): ENS = harmonic mean of
+# MAD, OLS, EMD, SSIM, plus SSIM_RAW, P-MAE and N-MAE, the same as
+# src/scripts/evaluate_ens.py (shared code: src/utils/ens_metrics.py). They need real
+# forecasts (full sampling), so they are computed only where inference is done anyway:
+# on the validation set in the validation epochs (accelerate.validate_epoch_interval),
+# and optionally on a sample of training cubes. Every cube is predicted
+# run.val_num_samples (K) times and the best prediction (highest ENS) is kept.
+# Columns of history.csv: val_ENS, val_MAD, ... and train_ENS, ...; plots in results/curves/.
+ens:
+  enabled: true
+  validation: true            # on the validation set, in the validation epochs
+  train: false                # also on a sample of training cubes
+  train_cubes: 100            # how many training cubes per evaluation
+  train_every_epochs: 1       # 1 = at the end of every epoch
+  train_fixed_subset: true    # same cubes every time (comparable curves) | new random sample each time
+  scoring: fast               # fast | toolkit
+  ssim_data_range: 2.0
+  cloud_mask: true            # exclude cloudy pixels, read from the original .npz
+  cloud_prob_threshold: 0.20
+  cloud_prob_scale: 100.0
+
+# Evaluation on the EarthNet test splits at the end of the diffusion training (phase 2):
+# when the training loop is over, src/scripts/evaluate_ens.py is run on these splits.
+# Output, same as running the script by hand:
+# <run>/results/statistics/metrics_results_<split>_K_<K>.{json,csv}
+# A failure here (e.g. a missing test folder) does not fail the run: the training is
+# already done, rerun evaluate_ens.py by hand. enabled: false skips it altogether.
+test_eval:
+  enabled: true
+  splits: [iid, ood, seasonal, extreme]
+  checkpoint: best            # best | latest | name of a folder in checkpoints/
+  num_samples: 1           # K predictions per cube (best kept); null = run.val_num_samples
+  subset: 3                   # 0 = every cube | N = N random cubes (quick test)
+  export_cubes: 2             # cubes per split with per-band figures in results/forecasts/<split>/, 0 = none
+  seed: 42
+
+# Live report on Weights & Biases (both phases): metrics, artifacts/ and
+# results/ files, example images. Never the checkpoints. Online needs `wandb login`.
+wandb:
+  enabled: false
+  project: REEP
+  entity: null                # null = default entity of the login
+  mode: online                # online | offline (then `wandb sync <run folder>/wandb/offline-run-*`)
+  tags: []
+  upload_files: true
+  log_images: true

@@ -94,6 +94,31 @@ def rows_by_location(manifest_path,
     return per_loc
 
 
+def locate_rows(manifest_path,
+                npy_path,
+                rows):
+    """
+    The cube each row of npy_path comes from: [(cube .npz path, time index in it), ...],
+    one per row of `rows`, in the same order (the time index is the one of
+    highresdynamic, which is where the cloud probability lives). The rows of a cube are
+    consecutive and `frames` lists their time indices (see rows_by_location).
+    """
+    man = json.loads(Path(manifest_path).read_text())
+    target = Path(npy_path).name
+    entry = next((v for v in man.values() if Path(v["path"]).name == target), None)
+    if entry is None:
+        raise KeyError(f"{target} non e' presente in {manifest_path}")
+
+    cubes = entry["cubes"]
+    ends = np.cumsum([len(c["frames"]) for c in cubes])
+    located = []
+    for row in rows:
+        k = int(np.searchsorted(ends, int(row), side="right"))
+        start = int(ends[k - 1]) if k else 0
+        located.append((cubes[k]["path"], int(cubes[k]["frames"][int(row) - start])))
+    return located
+
+
 def split_composition(per_loc,
                       locations=None):
     """Images, cubes and locations of a split (all of per_loc if locations is None)."""

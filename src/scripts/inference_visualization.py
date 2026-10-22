@@ -692,9 +692,6 @@ def run_inference_dit(loader: DataLoader, bundle: DitBundle, device: torch.devic
                 metrics_arvi=None,
                 past_weigth=cfg.diffusion.loss_fn_config.params.past_weight,
                 val_num_samples=1,
-                save_dir=None,
-                save_counter=None,
-                save_limit=0,
             )
         target, pred = forecast["target"], forecast["pred"]
         for b in range(pred.shape[0]):

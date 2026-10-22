@@ -1,6 +1,6 @@
 """
-Figures of a training run: metric curves, reconstruction examples (phase 1)
-and forecast examples (phase 2).
+Figures of a training run: metric curves and the per-band example grids
+(reconstructions of phase 1, forecasts of phase 2).
 
 Only matplotlib's object-oriented API (Figure, no pyplot): no global figure
 state and no GUI backend, so it is safe to call from a training loop running
@@ -11,6 +11,7 @@ import csv
 import os
 
 import numpy as np
+from matplotlib import colormaps
 from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
 
@@ -82,68 +83,92 @@ def plot_history(history_csv: str,
                     dpi=120)
 
 
+BAND_NAMES = ("blue", "green", "red", "nir")      # order of src/dataset/preprocessing.py
+MAX_COLUMNS = 20                                  # columns of one figure; more are subsampled
+
+
+def column_indices(n: int,
+                   max_columns: int = MAX_COLUMNS) -> list:
+    """All the n columns up to max_columns, otherwise max_columns evenly spread (first and last included)."""
+    if n <= max_columns:
+        return list(range(n))
+    return sorted(set(np.linspace(0, n - 1, num=max_columns).round().astype(int).tolist()))
+
+
 def _stretch(img: np.ndarray,
-             lo: np.ndarray,
-             hi: np.ndarray) -> np.ndarray:
-    """Linear stretch to [0, 1] with the given per-channel bounds."""
-    return np.clip((img - lo) / np.maximum(hi - lo, 1e-6), 0.0, 1.0)
+             lo: float,
+             hi: float) -> np.ndarray:
+    """Linear stretch to [0, 1] with the given bounds."""
+    return np.clip((img - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
 
 
-def save_reconstruction_grid(inputs: np.ndarray,
-                             recons: np.ndarray,
-                             path: str,
-                             title: str = None,
-                             rgb_bands: tuple = (2, 1, 0),
-                             nir_band: int = 3):
+def save_band_grids(truth: np.ndarray,
+                    pred: np.ndarray,
+                    prob: np.ndarray,
+                    out_dirs,
+                    col_titles: list,
+                    valid: np.ndarray = None,
+                    pred_label: str = "reconstruction",
+                    title: str = None,
+                    band_names: tuple = BAND_NAMES,
+                    cell: float = 1.6,
+                    dpi: int = 100):
     """
-    One row per example, columns: input RGB | reconstruction RGB | input NIR |
-    reconstruction NIR | |error| averaged over the bands.
+    One PNG per band, <folder>/<band>.png in every folder of out_dirs (the same figure
+    is written to all of them). One column per image, four rows:
 
-    inputs, recons: (N, C, H, W) in [-1, 1]. Each row is stretched with the
-    2-98 percentiles of its input, applied identically to the reconstruction,
-    so the two are directly comparable. The error maps share one color scale.
-    The default bands follow src/dataset/preprocessing.py: blue, green, red, NIR.
+        ground truth        the band, stretched with the 2-98 percentiles of that
+                            column's ground truth
+        reconstruction      (pred_label) the same band with the same stretch, so the
+                            two rows are directly comparable
+        cloud probability   0 (clear) to 1 (cloud)
+        |error| / 2         |pred - truth| / 2: the values are in [-1, 1], so the
+                            range is 2 and the error falls in [0, 1]. Same color
+                            scale as the cloud probability, one colorbar on the right
+
+    truth, pred: (N, C, H, W) in [-1, 1]. prob: (N, H, W) in [0, 1], NaN = unknown (grey).
+    valid: (N, H, W) bool, False pixels are grey in the error row (the ones the metrics
+    leave out); None = every pixel counts.
     """
-    n = inputs.shape[0]
-    error = np.abs(recons - inputs).mean(axis=1)
-    error_max = float(np.percentile(error, 99)) or 1.0
-    columns = ("input RGB", "recon RGB", "input NIR", "recon NIR", "|error|")
+    if isinstance(out_dirs, (str, os.PathLike)):
+        out_dirs = [out_dirs]
+    for folder in out_dirs:
+        os.makedirs(folder, exist_ok=True)
 
-    fig = Figure(figsize=(2.2 * len(columns), 2.2 * n + 0.6), layout="constrained")
-    axes = fig.subplots(n, len(columns), squeeze=False)
-    for i in range(n):
-        rgb_in = np.transpose(inputs[i, list(rgb_bands)], (1, 2, 0))
-        rgb_out = np.transpose(recons[i, list(rgb_bands)], (1, 2, 0))
-        lo = np.percentile(rgb_in, 2, axis=(0, 1))
-        hi = np.percentile(rgb_in, 98, axis=(0, 1))
+    n, n_bands = truth.shape[0], truth.shape[1]
+    error = np.clip(np.abs(pred - truth) / 2.0, 0.0, 1.0)
+    cmap = colormaps["magma"].copy()
+    cmap.set_bad("0.6")
+    prob_masked = np.ma.masked_invalid(prob)
+    row_labels = ("ground truth", pred_label, "cloud probability", "|error| / 2")
 
-        nir_in = inputs[i, nir_band]
-        nir_lo, nir_hi = np.percentile(nir_in, 2), np.percentile(nir_in, 98)
+    for c in range(n_bands):
+        name = band_names[c] if c < len(band_names) else f"band{c}"
+        error_c = error[:, c] if valid is None else np.ma.masked_where(~valid, error[:, c])
 
-        axes[i, 0].imshow(_stretch(rgb_in, lo, hi))
-        axes[i, 1].imshow(_stretch(rgb_out, lo, hi))
-        axes[i, 2].imshow(_stretch(nir_in, nir_lo, nir_hi),
-                          cmap="gray")
-        axes[i, 3].imshow(_stretch(recons[i, nir_band], nir_lo, nir_hi),
-                          cmap="gray")
-        err = axes[i, 4].imshow(error[i],
-                                cmap="magma",
-                                vmin=0.0,
-                                vmax=error_max)
-        for j, ax in enumerate(axes[i]):
-            ax.set_xticks([])
-            ax.set_yticks([])
-            if i == 0:
-                ax.set_title(columns[j], fontsize=9)
-
-    fig.colorbar(err,
-                 ax=axes[:, 4],
-                 shrink=0.6,
-                 label="mean |error| over bands")
-    if title:
-        fig.suptitle(title)
-    fig.savefig(path,
-                dpi=110)
+        fig = Figure(figsize=(cell * n + 1.4, cell * 4 + 0.9), layout="constrained")
+        axes = fig.subplots(4, n, squeeze=False)
+        for j in range(n):
+            lo = float(np.percentile(truth[j, c], 2))
+            hi = float(np.percentile(truth[j, c], 98))
+            axes[0, j].imshow(_stretch(truth[j, c], lo, hi), cmap="gray", vmin=0.0, vmax=1.0)
+            axes[1, j].imshow(_stretch(pred[j, c], lo, hi), cmap="gray", vmin=0.0, vmax=1.0)
+            image = axes[2, j].imshow(prob_masked[j], cmap=cmap, vmin=0.0, vmax=1.0)
+            axes[3, j].imshow(error_c[j], cmap=cmap, vmin=0.0, vmax=1.0)
+            axes[0, j].set_title(col_titles[j], fontsize=8)
+        for i, ax_row in enumerate(axes):
+            for ax in ax_row:
+                ax.set_xticks([])
+                ax.set_yticks([])
+            ax_row[0].set_ylabel(row_labels[i], fontsize=8)
+        fig.colorbar(image,
+                     ax=axes[2:, -1],
+                     shrink=0.8,
+                     label="cloud probability  |  |error| / 2   (0-1)")
+        fig.suptitle(f"{title} - {name}" if title else name)
+        for folder in out_dirs:
+            fig.savefig(os.path.join(folder, f"{name}.png"),
+                        dpi=dpi)
 
 
 # ============================== PHASE 2: DIFFUSION ==============================
@@ -339,87 +364,3 @@ def plot_lead_time_rmse(lead_time_csv: str,
     ax.legend()
     fig.savefig(path,
                 dpi=120)
-
-
-def forecast_lead_indices(n_predict: int,
-                          n_columns: int) -> list:
-    """n_columns lead times evenly spread over the predicted frames, first and last included."""
-    return sorted(set(np.linspace(0, n_predict - 1, num=min(n_columns, n_predict))
-                      .round().astype(int).tolist()))
-
-
-def save_forecast_grid(context: np.ndarray,
-                       target: np.ndarray,
-                       pred: np.ndarray,
-                       path: str,
-                       n_columns: int,
-                       names: list = None,
-                       title: str = None,
-                       rgb_bands: tuple = (2, 1, 0)):
-    """
-    Three rows per cube: ground truth, prediction, |error| averaged over the
-    bands. The first column is the last context frame, the others are
-    n_columns lead times evenly spread over the predicted frames.
-
-    context: (N, T_context, C, H, W); target, pred: (N, T_predict, C, H, W),
-    all in [-1, 1]. Each column is stretched with the 2-98 percentiles of its
-    ground-truth frame, applied identically to the prediction below it: a
-    cloudy frame does not darken the clear ones, and the prediction stays
-    directly comparable to its target. The error maps share one color scale. The default bands follow
-    src/dataset/preprocessing.py: blue, green, red, NIR.
-    """
-    n, n_context = context.shape[0], context.shape[1]
-    leads = forecast_lead_indices(target.shape[1],
-                                  n_columns)
-    error = np.abs(pred - target).mean(axis=2)
-    error_max = float(np.percentile(error[:, leads], 99)) or 1.0
-    titles = [f"context t={n_context}"] + [f"t+{i + 1}" for i in leads]
-
-    def rgb(frame):
-        return np.transpose(frame[list(rgb_bands)], (1, 2, 0))
-
-    fig = Figure(figsize=(1.9 * len(titles), 1.9 * 3 * n + 0.6), layout="constrained")
-    axes = fig.subplots(3 * n, len(titles), squeeze=False)
-    for i in range(n):
-        gt_row, pred_row, err_row = axes[3 * i], axes[3 * i + 1], axes[3 * i + 2]
-
-        def bounds(frame):
-            return (np.percentile(frame, 2, axis=(0, 1)),
-                    np.percentile(frame, 98, axis=(0, 1)))
-
-        gt_row[0].imshow(_stretch(rgb(context[i, -1]), *bounds(rgb(context[i, -1]))))
-        for j, t in enumerate(leads, start=1):
-            lo, hi = bounds(rgb(target[i, t]))
-            gt_row[j].imshow(_stretch(rgb(target[i, t]), lo, hi))
-            pred_row[j].imshow(_stretch(rgb(pred[i, t]), lo, hi))
-            err = err_row[j].imshow(error[i, t],
-                                    cmap="magma",
-                                    vmin=0.0,
-                                    vmax=error_max)
-
-        name = f"{names[i][:28]}\n" if names else f"cube {i}\n"
-        for row, label in ((gt_row, f"{name}ground truth"),
-                           (pred_row, "prediction"),
-                           (err_row, "|error|")):
-            for ax in row:
-                ax.set_xticks([])
-                ax.set_yticks([])
-            # the context column of the prediction and error rows stays empty
-            if row is not gt_row:
-                for spine in row[0].spines.values():
-                    spine.set_visible(False)
-            row[0].set_ylabel(label,
-                              fontsize=8)
-        if i == 0:
-            for j, ax in enumerate(gt_row):
-                ax.set_title(titles[j],
-                             fontsize=9)
-
-    fig.colorbar(err,
-                 ax=axes[:, -1],
-                 shrink=0.4,
-                 label="mean |error| over bands")
-    if title:
-        fig.suptitle(title)
-    fig.savefig(path,
-                dpi=100)

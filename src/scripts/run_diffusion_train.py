@@ -17,7 +17,8 @@ from src.config import config_from_cli
 from src.model.diffusion_utils import (configure_train, describe_run, instantiate_models,
                                        mark_run_ended, prepare_training, setup_dataloader,
                                        train_loop)
-from src.training.ens_eval import check_ens_dependencies, evaluate_test_splits, release_gpu_memory
+from src.training.ens_eval import (check_ens_dependencies, evaluate_test_splits,
+                                   export_val_forecasts, release_gpu_memory)
 from src.training.run_outputs import create_shared_run_outputs
 from src.training.runtime import setup_runtime
 from src.training.tracking import start_tracker
@@ -140,11 +141,13 @@ def main(config_file=DEFAULT_CONFIG_FILE,
         # dropped first (the scheduler still refers to the optimizer, so the parameters
         # of the DiT stay on the GPU next to the copy the evaluation loads: a few hundred
         # MB for a DiT-B). A failure of the evaluation itself is logged and does not fail
-        # the run (see evaluate_test_splits).
-        if cfg.test_eval.enabled:
+        # the run (see evaluate_test_splits). Before it, the per-band figures of the validation
+        # cubes with the best checkpoint (results/forecasts/val/).
+        if cfg.test_eval.enabled or cfg.diffusion.n_forecast_examples:
             del (model, conditioner, first_stage_model, optimizer, denoiser, sampler,
                  loss_fn, train_dataloader, val_dataloader)
             release_gpu_memory(rt.accelerator)
+            export_val_forecasts(cfg, rt, outputs, state)
             evaluate_test_splits(cfg, rt, outputs, state)
     except BaseException as error:
         mark_run_ended(cfg,

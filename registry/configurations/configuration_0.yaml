@@ -7,7 +7,6 @@ run:
   validate_only: false
   scale_lr: false
   allow_tf32: true
-  save_val_images_max: 0
   set: []
   show_debug_log: false
 
@@ -55,8 +54,8 @@ autoencoder:
   save_path: vae_s2_T${.T}_best.pth
   save_checkpoints: true          # only best.pt and last.pt
   resume_from: null
-  n_recon_examples: 8
-  examples_every: 5
+  n_recon_examples: 8         # validation images in results/reconstructions/epochs_XXX/ and final/, 0 = none
+  examples_every: 5           # epochs; 0 = only final/
   grad_clip_norm: 1.0
   weight_decay: 1e-4
   save_best_by: loss
@@ -86,8 +85,7 @@ diffusion:
   img_log_step_inteval: 1000000
   log_keys: [txt]
   # outputs_dir is derived: ${paths.outputs_dir}/diffusion (one folder per run)
-  n_forecast_examples: 4      # validation cubes in results/forecasts/val_epoch_XXX.png, 0 = none
-  forecast_lead_columns: 5    # lead times shown per cube
+  n_forecast_examples: 4      # validation cubes in results/forecasts/epoch_XXX/<cube>/ (and val/ at the end, best checkpoint), 0 = none
 
   network_config:
     target: sgm.modules.diffusionmodules.models.DiT.DiT
@@ -253,6 +251,7 @@ test_eval:
   checkpoint: best            # best | latest | name of a folder in checkpoints/
   num_samples: null           # K predictions per cube (best kept); null = run.val_num_samples
   subset: 0                   # 0 = every cube | N = N random cubes (quick test)
+  export_cubes: 4             # cubes per split with per-band figures in results/forecasts/<split>/, 0 = none
   seed: 42
 
 # Live report on Weights & Biases (both phases): metrics, artifacts/ and

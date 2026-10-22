@@ -66,8 +66,16 @@ Come nello scoring ufficiale i pixel nuvolosi sono esclusi dal confronto, ma il
 modello non vede la maschera: riceve gli stessi input del training. La maschera si
 legge dai file .npz originali (il dataloader attuale scarta le bande oltre la quarta):
 
+Figure per banda
+----------------
+--export-cubes N salva, per N cubi di ogni split (sempre gli stessi: seed del run, nomi
+ordinati), una cartella per cubo con un PNG per banda: ground truth, predizione (la migliore
+delle K), cloud probability ed errore |pred - target| / 2, una colonna per istante predetto.
+I pixel non validi sono grigi nella riga dell'errore.
+
 Output
 ------
+registry/outputs/diffusion/<run>/results/forecasts/<split>/<cubo>/<banda>.png
 registry/outputs/diffusion/<run>/results/statistics/
     metrics_results_<split>_K_<K>.json   aggregati + metadati (checkpoint, finestre,
                                          maschera, tempi) + una voce per cubo
@@ -87,6 +95,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 # inference_visualization.py sta nella stessa cartella: lo si importa da li' anche
@@ -105,6 +114,7 @@ from src.config import PathsCfg, project_path, use_project_dir  # noqa: E402
 from src.dataset.dataset_info import load_dataset_info  # noqa: E402
 # lo scoring ENS sta in src/utils/ens_metrics.py, condiviso con il training loop
 # e con evaluate_ae_ens.py
+from src.utils.example_export import pick_cubes, save_cube_forecast  # noqa: E402
 from src.utils.ens_metrics import (  # noqa: E402
     CLOUD_PROB_SCALE, CLOUD_PROB_THRESHOLD, SCORING_MODES, SSIM_DATA_RANGE, SSIM_SCALING,
     STATISTICS_DIRNAME, MaskedCubeDataset, MaskSources, aggregate, score_batch,
@@ -242,9 +252,6 @@ def predict_pixels(batch: Dict, bundle: viz.DitBundle, device: torch.device, n_t
                 metrics_arvi=None,
                 past_weigth=cfg.diffusion.loss_fn_config.params.past_weight,
                 val_num_samples=1,
-                save_dir=None,
-                save_counter=None,
-                save_limit=0,
             )
         # .cpu() su CUDA sincronizza: il tempo misurato fuori e' quello vero
         preds.append(forecast["pred"].detach().float().cpu())
@@ -359,9 +366,9 @@ def checkpoint_step(ckpt: Path) -> Optional[int]:
         return None
 
 
-def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
-                   device: torch.device, state: Dict) -> Dict[str, object]:
-    """Carica il modello (se servono altre finestre), gira sullo split, aggrega e salva."""
+def prepare_bundle(spec: viz.SplitSpec, args, cfg, ckpt: Path, device: torch.device,
+                   state: Dict):
+    """(contesto, target, config con le finestre dello split, modello): lo (ri)carica se serve."""
     n_context, n_target = viz.split_windows(spec, cfg)
     split_cfg = viz.with_windows(cfg, n_context, n_target)
     if split_cfg is not cfg:
@@ -379,7 +386,44 @@ def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
             torch.cuda.empty_cache()
         state["bundle"] = viz.load_dit(split_cfg, ckpt, device)
         state["windows"] = (n_context, n_target)
-    bundle = state["bundle"]
+    return n_context, n_target, split_cfg, state["bundle"]
+
+
+def export_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
+                 device: torch.device, state: Dict) -> Dict[str, object]:
+    """
+    --export-only: solo le figure per banda di args.export_cubes cubi dello split (gli stessi
+    cubi del training e di una valutazione normale), con una predizione per cubo. Niente
+    scoring, niente file in statistics/.
+    """
+    n_context, n_target, split_cfg, bundle = prepare_bundle(spec, args, cfg, ckpt, device, state)
+    files, sources, _ = build_split(spec, split_cfg, args, n_context, n_target)
+    chosen = [Path(f) for f in pick_cubes(files, args.export_cubes, int(cfg.run.seed))]
+    _, loader = build_loader(split_cfg, chosen, sources, args, n_context, n_target,
+                             int(cfg.data.params.T))
+    export_dir = run_dir / "results" / "forecasts" / spec.name
+    cloud_cfg = SimpleNamespace(cloud_prob_threshold=args.cloud_prob_threshold,
+                                cloud_prob_scale=args.cloud_prob_scale)
+    log.info(f"[{spec.name}] per-band figures of {len(chosen)} cubes in {export_dir}")
+
+    set_seed(args.seed)
+    for batch in loader:
+        cube_paths = batch["cube_path"]
+        batch.pop("cloud_mask", None)
+        batch = viz.move_batch(batch, device, bundle.weight_dtype)
+        preds, target = predict_pixels(batch, bundle, device, n_target, 1)
+        for b, path in enumerate(cube_paths):
+            save_cube_forecast([export_dir], path, target[b], preds[0][b], sources[str(path)],
+                               cloud_cfg, split_cfg.data.params.resize,
+                               masked=bool(args.cloud_mask),
+                               title=f"{spec.name} | {ckpt.name}")
+    return {"split": spec.name, "n_cubes": len(chosen), "dir": export_dir.as_posix()}
+
+
+def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
+                   device: torch.device, state: Dict) -> Dict[str, object]:
+    """Carica il modello (se servono altre finestre), gira sullo split, aggrega e salva."""
+    n_context, n_target, split_cfg, bundle = prepare_bundle(spec, args, cfg, ckpt, device, state)
 
     t_data = time.time()
     files, sources, desc = build_split(spec, split_cfg, args, n_context, n_target)
@@ -405,6 +449,15 @@ def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
     set_seed(args.seed)
     np.random.seed(args.seed)
 
+    # --export-cubes: the same cubes every time (fixed seed, sorted files), also the ones the
+    # training exported for val
+    export_cubes = set(pick_cubes(files, args.export_cubes, int(cfg.run.seed)))
+    export_dir = run_dir / "results" / "forecasts" / spec.name
+    cloud_cfg = SimpleNamespace(cloud_prob_threshold=args.cloud_prob_threshold,
+                                cloud_prob_scale=args.cloud_prob_scale)
+    if export_cubes:
+        log.info(f"[{spec.name}] per-band figures of {len(export_cubes)} cubes in {export_dir}")
+
     rows: List[Dict[str, object]] = []
     t0 = time.time()
     t_infer = t_score = 0.0
@@ -421,9 +474,20 @@ def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
         t_infer += time.time() - t_batch
 
         t_batch = time.time()
-        rows.extend(score_batch(preds, target, cloud, cube_paths, lo, hi,
-                                args.ssim_data_range, args.scoring))
+        batch_rows = score_batch(preds, target, cloud, cube_paths, lo, hi,
+                                 args.ssim_data_range, args.scoring)
+        rows.extend(batch_rows)
         t_score += time.time() - t_batch
+
+        # per-band figures of the chosen cubes, with the best of the K predictions (the one
+        # the ENS kept). Not counted in the scoring time.
+        for b, path in enumerate(cube_paths):
+            if str(path) in export_cubes:
+                save_cube_forecast([export_dir], path, target[b],
+                                   preds[batch_rows[b].get("sample") or 0][b],
+                                   sources[str(path)], cloud_cfg, p.resize,
+                                   masked=bool(args.cloud_mask),
+                                   title=f"{spec.name} | {ckpt.name} (best of K={args.num_samples})")
 
         done = len(rows)
         if done % max(loader.batch_size * 5, 1) == 0 or done == n_cubes:
@@ -546,6 +610,13 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                    help="data_range della SSIM. 2.0 e' quello con cui e' calibrato "
                         "l'esponente del toolkit; 1.0 e' l'ampiezza reale della "
                         "riflettanza ma rende i punteggi non confrontabili con la letteratura")
+    p.add_argument("--export-cubes", type=int, default=0,
+                   help="per-band figures (ground truth, prediction, cloud probability, error) "
+                        "of N cubes of each split, in <run>/results/forecasts/<split>/<cube>/; "
+                        "the same cubes at every run (0 = none)")
+    p.add_argument("--export-only", action="store_true",
+                   help="solo le figure di --export-cubes cubi per split, con una predizione "
+                        "per cubo: niente metriche e niente file in statistics/")
     p.add_argument("--seed", type=int, default=42,
                    help="seed del sampling e del rumore di OLS")
     p.add_argument("--device", type=str, default=None, help="cuda, cuda:0, cpu (default: auto)")
@@ -581,6 +652,8 @@ def evaluate_run(args, raise_on_failure: bool = True) -> List[Dict[str, object]]
         raise SystemExit("--num-samples deve essere >= 1")
     if args.subset and args.max_cubes:
         raise SystemExit("--subset e --max-cubes sono alternativi")
+    if args.export_only and args.export_cubes < 1:
+        raise SystemExit("--export-only richiede --export-cubes >= 1")
 
     run_dir = viz.resolve_run(args.model, family_dir)
     cfg = viz.load_run_config(run_dir)
@@ -612,9 +685,10 @@ def evaluate_run(args, raise_on_failure: bool = True) -> List[Dict[str, object]]
     state: Dict = {"bundle": None, "windows": None}
     payloads: List[Dict[str, object]] = []
     failed: List[Tuple[str, str]] = []
+    run_split = export_split if args.export_only else evaluate_split
     for spec in args.split:
         try:
-            payloads.append(evaluate_split(spec, args, cfg, run_dir, ckpt, device, state))
+            payloads.append(run_split(spec, args, cfg, run_dir, ckpt, device, state))
         except SystemExit as err:
             failed.append((spec.name, str(err)))
             log.error(f"[{spec.name}] saltato -- {err}")
@@ -622,7 +696,7 @@ def evaluate_run(args, raise_on_failure: bool = True) -> List[Dict[str, object]]
             failed.append((spec.name, f"{type(err).__name__}: {err}"))
             log.exception(f"[{spec.name}] saltato")
 
-    if len(payloads) > 1:
+    if len(payloads) > 1 and not args.export_only:
         print_comparison(payloads)
     if failed:
         print(f"{len(failed)} split NON valutati:")

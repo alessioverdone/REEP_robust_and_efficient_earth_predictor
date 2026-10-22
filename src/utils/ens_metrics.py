@@ -80,6 +80,43 @@ def valid_mask(hd: np.ndarray, threshold: float, prob_scale: float) -> np.ndarra
     return np.transpose(valid, (2, 0, 1))
 
 
+def cloud_prob_cube(hd: np.ndarray, prob_scale: float) -> np.ndarray:
+    """
+    highresdynamic (H, W, C, T) di un file originale -> (T, H, W) float32 in [0, 1],
+    1 = nuvola. Stessi due formati di valid_mask: 7 canali = cloud probability al canale 4
+    (divisa per prob_scale), 5 canali = la maschera binaria in fondo (0 o 1). I valori non
+    finiti contano come nuvola, come in valid_mask.
+    """
+    if hd.shape[2] >= N_CHANNELS_WITH_CLOUD_PROB:
+        prob = hd[:, :, CLOUD_PROB_CHANNEL, :] / prob_scale
+    else:
+        prob = hd[:, :, -1, :]
+    prob = np.nan_to_num(np.asarray(prob, dtype=np.float32), nan=1.0, posinf=1.0, neginf=0.0)
+    return np.transpose(np.clip(prob, 0.0, 1.0), (2, 0, 1))
+
+
+def load_cloud_frames(path, frames: Sequence[int], threshold: float, prob_scale: float,
+                      resize: Optional[int]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    (cloud probability, pixel validi) di alcuni istanti di un cubo originale, per le figure:
+    due array (n, h, w), float32 in [0, 1] e bool (True = pixel valido, la stessa regola
+    dello scoring ENS). Il modello non li vede.
+
+    Con resize minore della risoluzione nativa la probabilita' e' la media dei sotto-pixel
+    (interpolazione area, come le immagini), mentre un pixel e' valido solo se lo sono tutti
+    i suoi sotto-pixel: e' la regola di MaskedCubeDataset, cosi' i pixel grigi delle figure
+    sono esattamente quelli esclusi dalle metriche.
+    """
+    with np.load(path) as z:
+        hd = z["highresdynamic"][:, :, :, list(frames)]
+    prob = torch.from_numpy(cloud_prob_cube(hd, prob_scale)).unsqueeze(1)           # (n, 1, H, W)
+    valid = torch.from_numpy(valid_mask(hd, threshold, prob_scale).astype(np.float32)).unsqueeze(1)
+    if resize is not None and tuple(prob.shape[-2:]) != (resize, resize):
+        prob = F.interpolate(prob, size=(resize, resize), mode="area")
+        valid = (F.interpolate(valid, size=(resize, resize), mode="area") >= 0.999).float()
+    return prob[:, 0].numpy(), valid[:, 0].numpy() > 0.5
+
+
 class MaskedCubeDataset(Dataset):
     """
     Il dataset di valutazione piu' la maschera nuvole dei frame target,

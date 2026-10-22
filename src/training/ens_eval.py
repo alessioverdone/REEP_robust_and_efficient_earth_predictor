@@ -42,6 +42,48 @@ ENS_KEYS = ("ENS", "MAD", "OLS", "EMD", "SSIM", "SSIM_RAW", "P_MAE", "N_MAE")
 logger = logging.getLogger(__name__)
 
 
+def _existing_checkpoint(outputs, checkpoint, tag):
+    """`checkpoint`, or "latest" when it is "best" and checkpoints/best does not exist."""
+    if checkpoint == "best" and not os.path.isfile(
+            os.path.join(outputs.checkpoints, "best", "model.safetensors")):
+        logger.warning(f"{tag} checkpoints/best not found (no validation improved the "
+                       f"minimum?): using the latest checkpoint")
+        return "latest"
+    return checkpoint
+
+
+def export_val_forecasts(cfg, rt, outputs, state):
+    """
+    results/forecasts/val/<cube>/<band>.png: the per-band figures of the validation cubes the
+    training exported at every epoch (diffusion.n_forecast_examples, same cubes), predicted by
+    the BEST checkpoint instead of the last model. One more inference (one prediction per cube,
+    no scoring), through evaluate_ens.py --export-only. Same rules as evaluate_test_splits: call
+    it after the training objects are released; only the main process runs; a failure is logged
+    and does not fail the run.
+    """
+    n = cfg.diffusion.n_forecast_examples
+    if n < 1 or cfg.run.validate_only or state.global_step <= 0:
+        return
+    if not rt.accelerator.is_main_process:
+        return
+
+    checkpoint = _existing_checkpoint(outputs, "best", "[val export]")
+    argv = ["--model", outputs.root,
+            "--split", "val",
+            "--checkpoint", checkpoint,
+            "--export-only",
+            "--export-cubes", str(n),
+            "--seed", str(cfg.test_eval.seed),
+            "--device", str(rt.accelerator.device)]
+    logger.info(f"[val export] evaluate_ens.py {' '.join(argv)}")
+    try:
+        from src.scripts import evaluate_ens
+        evaluate_ens.evaluate_run(evaluate_ens.parse_args(argv),
+                                  raise_on_failure=False)
+    except (Exception, SystemExit) as error:     # noqa: BLE001 - never lose a finished run
+        logger.exception(f"[val export] failed, run kept as completed: {error}")
+
+
 def evaluate_test_splits(cfg, rt, outputs, state):
     """
     End of the diffusion training: src/scripts/evaluate_ens.py on the splits of
@@ -62,12 +104,7 @@ def evaluate_test_splits(cfg, rt, outputs, state):
     if not rt.accelerator.is_main_process:
         return None
 
-    checkpoint = test_eval.checkpoint
-    if checkpoint == "best" and not os.path.isfile(
-            os.path.join(outputs.checkpoints, "best", "model.safetensors")):
-        logger.warning("[test_eval] checkpoints/best not found (no validation improved the "
-                       "minimum?): using the latest checkpoint")
-        checkpoint = "latest"
+    checkpoint = _existing_checkpoint(outputs, test_eval.checkpoint, "[test_eval]")
     k = int(test_eval.num_samples or cfg.run.val_num_samples)
     argv = ["--model", outputs.root,
             "--split", *test_eval.splits,
@@ -77,6 +114,8 @@ def evaluate_test_splits(cfg, rt, outputs, state):
             "--device", str(rt.accelerator.device)]
     if test_eval.subset:
         argv += ["--subset", str(test_eval.subset)]
+    if test_eval.export_cubes:
+        argv += ["--export-cubes", str(test_eval.export_cubes)]
 
     logger.info(f"[test_eval] evaluate_ens.py {' '.join(argv)}")
     start = time.time()

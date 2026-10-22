@@ -96,7 +96,10 @@ registry/outputs/autoencoder/<YYYY-MM-DD_HH-MM-SS>/
   checkpoints/           best.pt and last.pt (none with autoencoder.save_checkpoints=false)
   results/
     curves/              loss, mse, psnr, ssim (train/val), lr
-    reconstructions/     val_epoch_XXX.png during training
+    reconstructions/     epochs_XXX/<band>.png every examples_every epochs, final/ with the
+                         best weights: n_recon_examples val images (always the same ones),
+                         columns = images, rows = ground truth / reconstruction / cloud
+                         probability / |error| / 2 (cloud and error share a 0-1 scale)
 ```
 
 Training stops early after `autoencoder.early_stopping_patience` epochs without
@@ -163,10 +166,12 @@ registry/outputs/diffusion/<YYYY-MM-DD_HH-MM-SS>/
                          val latter_rmse), with best_metric.json
   results/
     curves/              loss, latent_rmse, pixel_rmse, rmse_by_lead_time, lr
-    forecasts/           val_epoch_XXX.png at every validation: the same
-                         diffusion.n_forecast_examples val cubes, ground truth /
-                         prediction / |error| at forecast_lead_columns lead times;
-                         final/ = one PNG per val cube from the last validation
+    forecasts/           epoch_XXX/<cube>/<band>.png at every validation: the same
+                         diffusion.n_forecast_examples val cubes, columns = predicted
+                         frames, rows = ground truth / prediction / cloud probability /
+                         |error| / 2 (grey = cloudy pixels, left out of the metrics);
+                         val/ = the same cubes with the best checkpoint (one more inference), iid/, ood/, ... =
+                         test splits (test_eval.export_cubes cubes each)
 ```
 
 `loss.png` has only the training curve, plus the validation one with

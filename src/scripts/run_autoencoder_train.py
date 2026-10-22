@@ -13,10 +13,11 @@ from src.config import config_from_cli
 from src.training.run_outputs import create_run_outputs, save_run_config
 from src.training.runtime import setup_autoencoder_runtime
 from src.training.tracking import start_tracker
-from src.training.train_autoencoder import (configure_train, describe_run,
+from src.training.train_autoencoder import (build_examples, configure_train, describe_run,
                                             instantiate_autoencoder, mark_run_ended,
                                             measure_scale_factor, prepare_training,
-                                            setup_dataloader, train_vae)
+                                            save_final_examples, setup_dataloader,
+                                            train_vae)
 
 # Lancio dall'IDE (Run/Debug, che non passa argomenti): valgono questi. Da
 # terminale --cfgdir e --project_name li scavalcano, e config_from_cli scrive a
@@ -52,6 +53,9 @@ def main(config_file=DEFAULT_CONFIG_FILE,
                                outputs,
                                "autoencoder")
 
+    # Validation images of the reconstruction figures (the same ones at every epoch)
+    examples = build_examples(cfg, loaders)
+
     # Training Loop + scale factor
     try:
         train_vae(cfg,
@@ -61,7 +65,8 @@ def main(config_file=DEFAULT_CONFIG_FILE,
                   vae,
                   optimizer,
                   scheduler,
-                  loaders)
+                  loaders,
+                  examples)
         # diffusion.scale_factor of the best weights, saved in best.pt for phase 2
         measure_scale_factor(cfg,
                              rt,
@@ -69,6 +74,12 @@ def main(config_file=DEFAULT_CONFIG_FILE,
                              state,
                              vae,
                              loaders)
+        # reconstruction figures of the best weights: results/reconstructions/final/
+        save_final_examples(rt,
+                            outputs,
+                            state,
+                            vae,
+                            examples)
     except BaseException as error:
         mark_run_ended(cfg,
                        rt,
