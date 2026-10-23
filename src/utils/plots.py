@@ -364,3 +364,71 @@ def plot_lead_time_rmse(lead_time_csv: str,
     ax.legend()
     fig.savefig(path,
                 dpi=120)
+
+
+# ======================== CONDITION PREDICTOR (MAMBA) ========================
+
+def save_condition_examples(context: np.ndarray,
+                            target: np.ndarray,
+                            forecast: np.ndarray,
+                            variables: list,
+                            path: str,
+                            title: str = None):
+    """
+    Weather forecasts of the Condition Predictor: one row per cube, one column
+    per variable, in the units of the cubes. The context frames, then the
+    observed future (dashed) and the forecast, on the frame index.
+
+    context (n_cubes, n_context, n_vars), target and forecast (n_cubes, n_predict, n_vars).
+    """
+    n_cubes, n_context, n_vars = context.shape
+    n_predict = target.shape[1]
+    past = np.arange(n_context)
+    future = np.arange(n_context, n_context + n_predict)
+
+    fig = Figure(figsize=(3.2 * n_vars, 2.3 * n_cubes), layout="constrained")
+    axes = fig.subplots(n_cubes, n_vars, squeeze=False)
+    for i in range(n_cubes):
+        for j in range(n_vars):
+            ax = axes[i, j]
+            ax.plot(past, context[i, :, j], color="black", marker="o", markersize=2, label="context")
+            ax.plot(future, target[i, :, j], color="black", linestyle="--", label="observed")
+            ax.plot(future, forecast[i, :, j], color="tab:blue", label="forecast")
+            ax.axvline(n_context - 0.5, color="gray", linestyle=":")
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax.grid(alpha=0.3)
+            if i == 0:
+                ax.set_title(variables[j])
+            if j == 0:
+                ax.set_ylabel(f"cube {i}")
+    axes[0, 0].legend(fontsize="small")
+    if title:
+        fig.suptitle(title)
+    fig.savefig(path,
+                dpi=110)
+
+
+def plot_condition_lead_rmse(rmse_by_lead: dict,
+                             path: str,
+                             title: str):
+    """
+    RMSE of the weather forecast by lead time (1 = first forecast frame), on
+    the normalized weather averaged over the variables: the model (solid) and
+    the baselines (dashed). rmse_by_lead: {name: [rmse per lead]}.
+    """
+    fig = Figure(figsize=(7, 4.5), layout="constrained")
+    ax = fig.add_subplot()
+    for name, values in rmse_by_lead.items():
+        leads = np.arange(1, len(values) + 1)
+        if name == "model":
+            ax.plot(leads, values, marker="o", markersize=3, label=name)
+        else:
+            ax.plot(leads, values, "--", label=f"{name} (baseline)")
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.set_xlabel("lead time (forecast frame)")
+    ax.set_ylabel("RMSE (weather in [-1, 1])")
+    ax.set_title(title)
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.savefig(path,
+                dpi=120)

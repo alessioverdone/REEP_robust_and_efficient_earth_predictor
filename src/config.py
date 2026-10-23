@@ -67,6 +67,7 @@ def _first_stage_down_ratio(first_stage: DictConfig) -> int:
 _RESOLVERS = {
     "tuple": lambda *args: tuple(args),                 # accelerate.optimizer.params.betas
     "floordiv": lambda a, b: a // b,
+    "sub": lambda a, b: a - b,                          # condition.n_context
     "first_stage_down_ratio": _first_stage_down_ratio,
 }
 for _name, _fn in _RESOLVERS.items():
@@ -267,6 +268,141 @@ class AutoencoderCfg:
     # dataloader
     prefetch_factor: int = 2
     persistent_workers: bool = True
+
+
+# ============================================== CONDITION ==============================================
+# Condition Predictor (Mamba): forecasts the weather of the target frames from
+# the weather of the context frames, so that the DiT can be conditioned on a
+# forecast instead of the observed future weather. Trained on its own, after the
+# preprocessing (src/scripts/run_condition_train.py), then frozen.
+#
+# The weather of a cube is mesodynamic (80x80 cells, 5 variables, one value
+# per day). It is reduced to one value per frame and per variable exactly as
+# the DiT dataloader does (load_meso_dynamic in src/dataset/dataloader_s2_dif.py):
+# mean of the center_crop x center_crop central cells, then aggregation of the
+# steps_per_frame days of every frame. The model reads the first n_context
+# frames (n_context x n_channels) and forecasts the next n_predict.
+#
+# Two architectures, chosen with model.name, with different parameters (the
+# schema is picked by load_config() / update_config(), as for the first stage).
+
+@dataclass
+class ConditionModelCfg:
+    name: str = "S_Mamba"                   # 'S_Mamba' | 'PatchMixer'
+
+
+@dataclass
+class SMambaParams:
+    # S-Mamba (src/model/mamba/S_Mamba.py). Starting values sized for a 10 x 5
+    # series: the final ones are chosen on the validation set (sweep).
+    d_model: int = 64                       # size of the token of every variable
+    d_state: int = 16                       # state size of the Mamba blocks
+    d_conv: int = 2                         # local convolution width of the Mamba blocks
+    expand: int = 1                         # block expansion factor of the Mamba blocks
+    d_ff: int = 128                         # hidden size of the feed-forward blocks
+    e_layers: int = 2
+    dropout: float = 0.1
+    activation: str = "gelu"                # gelu | relu
+    # instance normalization of every variable over its context window. With a
+    # dry context the precipitation has std ~0, and its forecast stays ~0
+    use_norm: bool = True
+
+
+@dataclass
+class SMambaCfg(ConditionModelCfg):
+    name: str = "S_Mamba"
+    params: SMambaParams = field(default_factory=SMambaParams)
+
+
+@dataclass
+class PatchMixerParams:
+    # PatchMixer (src/model/mamba/PatchMixer.py), alternative to S-Mamba
+    patch_len: int = 4                      # must not exceed condition.n_context
+    patch_stride: int = 2
+    mixer_kernel_size: int = 8
+    d_model: int = 64
+    e_layers: int = 2
+    dropout: float = 0.1
+    head_dropout: float = 0.0
+
+
+@dataclass
+class PatchMixerCfg(ConditionModelCfg):
+    name: str = "PatchMixer"
+    params: PatchMixerParams = field(default_factory=PatchMixerParams)
+
+
+CONDITION_MODEL_SCHEMAS: dict[str, type[ConditionModelCfg]] = {
+    "S_Mamba": SMambaCfg,
+    "PatchMixer": PatchMixerCfg,
+}
+
+
+@dataclass
+class ConditionCfg:
+    # --- series (derived from data.params: the same frames and cells the DiT reads) ---
+    T: int = "${data.params.T}"                         # frames of a cube
+    n_predict: int = "${data.params.noise_image_num}"   # frames forecast
+    n_context: int = "${sub:${.T},${.n_predict}}"       # frames read by the model (derived)
+    n_channels: int = "${data.params.meso_channels}"
+    steps_per_frame: int = "${data.params.meso_steps_per_frame}"
+    center_crop: int = "${data.params.meso_center_crop}"
+    # The days of a frame -> one value. 'mean' (the choice for Mamba): the
+    # weather accumulated over the frame, a less noisy target than a single
+    # day. NOTE: the DiT reads data.params.meso_agg; to condition it on the
+    # forecast of this model the two must be equal (load_condition_predictor
+    # checks it).
+    meso_agg: str = "mean"
+    # Labels of the channels of mesodynamic, in order (EarthNet2021: RR, PP,
+    # TG, TN, TX). Used only to name metrics and plots: with a different number
+    # of channels (data.params.meso_channels) generic names are used instead
+    # (see variable_names in src/dataset/meso_series.py), so the other phases
+    # are never blocked by a label.
+    variables: list[str] = field(default_factory=lambda: [
+        "precipitation", "sea_pressure", "mean_temperature",
+        "min_temperature", "max_temperature"])
+
+    # Series written by src/dataset/meso_series.py: one .npz per split, the
+    # normalization (stats.json) and series.json. A folder per aggregation, so
+    # changing meso_agg never overwrites the other series.
+    series_dir: str = "${paths.preprocessed_dir}/condition_${.meso_agg}"
+    # EarthNet test splits extracted too, when data/raw/<split>_test_split/ exists
+    test_splits: list[str] = field(default_factory=lambda: ["iid", "ood"])
+    extract_workers: int = 8
+
+    # --- model ---
+    model: ConditionModelCfg = field(default_factory=SMambaCfg)
+
+    # --- training (AdamW, ReduceLROnPlateau on val_loss) ---
+    batch_size: int = 256
+    num_workers: int = 0                    # the series fit in memory
+    num_epochs: int = 100
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    grad_clip_norm: float = 1.0
+    lr_scheduler_factor: float = 0.5
+    lr_scheduler_patience: int = 5
+    # stop after early_stopping_patience epochs without val_loss improving by
+    # more than early_stopping_min_delta (0 = never)
+    early_stopping_patience: int = 15
+    early_stopping_min_delta: float = 0.0
+
+    # Outputs: every run writes ONLY into <outputs_dir>/<start timestamp>/
+    # (artifacts/, checkpoints/, results/), see src/training/run_outputs.py.
+    outputs_dir: str = "${paths.outputs_dir}/condition"
+    save_checkpoints: bool = True           # best.pt and last.pt
+    # results/forecasts/val_epoch_XXX.png: this many validation cubes (always
+    # the same ones) every examples_every epochs; 0 = none
+    n_examples: int = 4
+    examples_every: int = 5
+
+    # For phase 2: the frozen model. 'latest' = best.pt of the most recent
+    # completed condition run on the current dataset, with the same series
+    # (meso_agg, n_context, n_predict); or a path to a best.pt.
+    pretrained_path: str = "latest"
+
+    MESO_AGGS: ClassVar[tuple[str, ...]] = ("last", "first", "mean", "sum")
+    TEST_SPLITS: ClassVar[tuple[str, ...]] = ("iid", "ood", "extreme", "seasonal")
 
 
 # ============================================== DIFFUSION ==============================================
@@ -826,6 +962,7 @@ class TrainCfg:
     paths: PathsCfg = field(default_factory=PathsCfg)
     preprocessing: PreprocessingCfg = field(default_factory=PreprocessingCfg)
     autoencoder: AutoencoderCfg = field(default_factory=AutoencoderCfg)
+    condition: ConditionCfg = field(default_factory=ConditionCfg)
     diffusion: DiffusionCfg = field(default_factory=DiffusionCfg)
     data: DataCfg = field(default_factory=DataCfg)
     accelerate: AccelerateCfg = field(default_factory=AccelerateCfg)
@@ -851,6 +988,25 @@ def _set_first_stage_schema(cfg: DictConfig, fs_type: Optional[str]) -> None:
         raise ValueError(f"{_FIRST_STAGE_TYPE_KEY} deve essere uno di "
                          f"{sorted(FIRST_STAGE_SCHEMAS)}, non {fs_type!r}")
     cfg.diffusion.first_stage_config = FIRST_STAGE_SCHEMAS[fs_type]()
+
+
+_CONDITION_MODEL_KEY = "condition.model.name"
+
+
+def _set_condition_model_schema(cfg: DictConfig, name: Optional[str]) -> None:
+    """Replaces the condition.model node with the schema of the architecture `name`."""
+    if name is None or name == cfg.condition.model.name:
+        return
+    if name not in CONDITION_MODEL_SCHEMAS:
+        raise ValueError(f"{_CONDITION_MODEL_KEY} must be one of "
+                         f"{sorted(CONDITION_MODEL_SCHEMAS)}, not {name!r}")
+    cfg.condition.model = CONDITION_MODEL_SCHEMAS[name]()
+
+
+def _set_variant_schemas(cfg: DictConfig, source: DictConfig) -> None:
+    """The variant nodes (first stage, condition model) chosen by `source`, before merging it."""
+    _set_first_stage_schema(cfg, OmegaConf.select(source, _FIRST_STAGE_TYPE_KEY))
+    _set_condition_model_schema(cfg, OmegaConf.select(source, _CONDITION_MODEL_KEY))
 
 
 def known_keys_only(saved: dict, schema: Any, prefix: str = "") -> tuple[dict, list[str]]:
@@ -881,6 +1037,12 @@ def load_config(*paths: Union[str, Path], overrides: Optional[list[str]] = None,
     piu': serve per rileggere il config salvato da un run vecchio (vedi
     load_saved_config). Per i config che si scrivono a mano resta False: li' una chiave
     sconosciuta e' quasi sempre un refuso, e deve fermare il lancio.
+
+    The architecture of the Condition Predictor (condition.model.name) is chosen
+    source by source instead, as --set does in update_from_args(): a source that
+    changes it replaces the node with the defaults of the new architecture
+    before being merged, so a yaml with the S_Mamba parameters can be followed
+    by an override condition.model.name=PatchMixer.
     """
     sources = [OmegaConf.load(p) for p in paths]
     override_sources = [OmegaConf.from_dotlist(list(overrides))] if overrides else []
@@ -893,12 +1055,18 @@ def load_config(*paths: Union[str, Path], overrides: Optional[list[str]] = None,
         # solo i file: gli override sono scritti a mano, un refuso li' deve fallire
         filtered = []
         for path, src in zip(paths, sources):
+            # the condition model of this file decides which of its params are known
+            _set_condition_model_schema(cfg, OmegaConf.select(src, _CONDITION_MODEL_KEY))
             kept, dropped = known_keys_only(OmegaConf.to_container(src), cfg)
             if dropped:
                 print(f"[config] {path}: chiavi non piu' nello schema, ignorate: {dropped}")
             filtered.append(OmegaConf.create(kept))
         sources = filtered
-    cfg = OmegaConf.merge(cfg, *sources, *override_sources)
+    # same result as OmegaConf.merge(cfg, *sources, *override_sources), with the
+    # condition model chosen before each source is merged
+    for src in sources + override_sources:
+        _set_condition_model_schema(cfg, OmegaConf.select(src, _CONDITION_MODEL_KEY))
+        cfg.merge_with(src)
 
     validate_config(cfg)
     return cfg  # type: ignore[return-value]
@@ -916,7 +1084,7 @@ def load_saved_config(path: Union[str, Path]) -> TrainCfg:
 
 def _merge_into(cfg: TrainCfg, source: DictConfig) -> TrainCfg:
     """Merge sul posto di `source` in `cfg` (chiavi e tipi controllati), poi validate_config()."""
-    _set_first_stage_schema(cfg, OmegaConf.select(source, _FIRST_STAGE_TYPE_KEY))
+    _set_variant_schemas(cfg, source)
     cfg.merge_with(source)
     validate_config(cfg)
     return cfg
@@ -1162,7 +1330,11 @@ def validate_config(cfg: TrainCfg) -> None:
         "diffusion.save_best_by": DiffusionCfg.SAVE_BEST_BY,
         "data.params.meso_agg": ("last", "first", "mean", "sum"),
         "data.params.meso_time_span": ("all", "future"),
+        _CONDITION_MODEL_KEY: tuple(CONDITION_MODEL_SCHEMAS),
+        "condition.meso_agg": ConditionCfg.MESO_AGGS,
     }
+    if cfg.condition.model.name == "S_Mamba":
+        choices["condition.model.params.activation"] = ("gelu", "relu")
     for key, allowed in choices.items():
         value = OmegaConf.select(cfg, key)
         if value not in allowed:
@@ -1182,6 +1354,13 @@ def validate_config(cfg: TrainCfg) -> None:
         "autoencoder.image_size": data.resize,
         "preprocessing.check_frames": data.T,
         "preprocessing.n_bands": data.n_channels,
+        # the condition predictor reads the weather of the same frames and cells as the DiT
+        "condition.T": data.T,
+        "condition.n_predict": data.noise_image_num,
+        "condition.n_context": data.T - data.noise_image_num,
+        "condition.n_channels": data.meso_channels,
+        "condition.steps_per_frame": data.meso_steps_per_frame,
+        "condition.center_crop": data.meso_center_crop,
     }
     # I params del first stage vengono dalla sezione `autoencoder`: la fase 2
     # deve ricostruire lo STESSO modello che la fase 1 ha addestrato.
@@ -1199,6 +1378,27 @@ def validate_config(cfg: TrainCfg) -> None:
         if value != expected:
             errors.append(f"{key}={value} incoerente: dovrebbe essere {expected} "
                           f"(e' derivato, meglio non fissarlo a mano)")
+
+    cond = cfg.condition
+    # the causal-conv1d CUDA kernel of the Mamba blocks supports widths 2 to 4
+    if cond.model.name == "S_Mamba" and not 2 <= cond.model.params.d_conv <= 4:
+        errors.append(f"condition.model.params.d_conv={cond.model.params.d_conv} must be "
+                      f"between 2 and 4 (causal-conv1d kernel of mamba_ssm)")
+    bad_splits =[s for s in cond.test_splits if s not in ConditionCfg.TEST_SPLITS]
+    if bad_splits:
+        errors.append(f"condition.test_splits: {bad_splits} unknown, values: {ConditionCfg.TEST_SPLITS}")
+    if cond.model.name == "PatchMixer" and cond.model.params.patch_len > cond.n_context:
+        errors.append(f"condition.model.params.patch_len={cond.model.params.patch_len} is longer "
+                      f"than the context (condition.n_context={cond.n_context} frames)")
+    for key in ("batch_size", "num_epochs", "extract_workers"):
+        if cond[key] < 1:
+            errors.append(f"condition.{key} must be >= 1")
+    if cond.lr <= 0:
+        errors.append("condition.lr must be > 0")
+    for key in ("num_workers", "early_stopping_patience", "early_stopping_min_delta",
+                "n_examples", "examples_every", "weight_decay", "grad_clip_norm"):
+        if cond[key] < 0:
+            errors.append(f"condition.{key} must be >= 0")
 
     pre = cfg.preprocessing
     if pre.limit < 0:

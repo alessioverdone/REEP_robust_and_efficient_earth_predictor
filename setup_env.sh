@@ -43,6 +43,17 @@ $PIP torch==2.8.0 torchvision==0.23.0 \
 echo ">>> Installo le altre dipendenze da requirements.txt..."
 $PIP -r requirements.txt
 
+# Kernel CUDA di Mamba per il Condition Predictor (passo 3b del README): si
+# compilano contro il torch appena installato, quindi dopo e senza build
+# isolation. Se la compilazione fallisce (niente nvcc) l'ambiente resta valido
+# per le altre fasi: S-Mamba non si potra' addestrare finche' non si installano.
+# Senza build isolation gli strumenti di compilazione devono essere gia' nel venv:
+# uv venv non li installa (setuptools, wheel, packaging, ninja).
+echo ">>> Installo i kernel di Mamba (causal-conv1d, mamba-ssm)..."
+$PIP setuptools wheel packaging ninja
+$PIP causal-conv1d mamba-ssm --no-build-isolation \
+    || echo "ATTENZIONE: mamba-ssm non installato (serve nvcc / CUDA): S-Mamba non disponibile, i test lo segnalano (mamba_ssm: CPU stand-in)"
+
 echo ""
 echo ">>> Verifica: torch, GPU e import della pipeline"
 "$VENV/bin/python" - <<'PY'
