@@ -1,0 +1,165 @@
+ERRORI CORRETTI NEL CODICE DI MAMBA
+===================================
+
+Quattro errori trovati nel codice ereditato e corretti. Per ognuno: l'errore,
+il codice com'era, la soluzione. Ogni correzione e' coperta da un test in
+tests/: se l'errore venisse reintrodotto, quel test fallirebbe.
+
+
+-------------------------------------------------------------------------------
+1. CORRELAZIONE (CORR) CALCOLATA CON UNA FORMULA SBAGLIATA
+-------------------------------------------------------------------------------
+
+ERRORE
+    La funzione CORR doveva calcolare la correlazione di Pearson tra
+    previsione e valore vero, ma il denominatore era sbagliato:
+
+        usato:    radice( somma(a^2 * b^2) )
+        corretto: radice( somma(a^2) * somma(b^2) )
+
+    con a e b gli scarti dalla media di valore vero e previsione. Il
+    risultato non era una correlazione: puo' superare 1 (in un test dava
+    7,26 dove la correlazione vera era 0,82). Su dati a 3 dimensioni
+    (campioni, passi, variabili) restituiva inoltre un vettore invece di un
+    numero. L'errore viene dalla libreria da cui il repo ha copiato le
+    metriche (Time-Series-Library). La funzione non era usata da nessuna
+    parte, quindi non ha falsato risultati.
+
+CODICE (src/utils/metrics.py, prima)
+
+    def CORR(pred, true):
+        u = ((true - true.mean(0)) * (pred - pred.mean(0))).sum(0)
+        d = np.sqrt(((true - true.mean(0)) ** 2 * (pred - pred.mean(0)) ** 2).sum(0))
+        return (u / d).mean(-1)
+
+SOLUZIONE
+    Correlazione di Pearson di ogni variabile (ultimo asse) su tutti gli
+    altri assi, poi media sulle variabili:
+
+    def CORR(pred, true):
+        pred = pred.reshape(-1, pred.shape[-1])
+        true = true.reshape(-1, true.shape[-1])
+        p = pred - pred.mean(0)
+        t = true - true.mean(0)
+        return np.mean((p * t).sum(0) / np.sqrt((p ** 2).sum(0) * (t ** 2).sum(0)))
+
+    Verifica: tests/test_mamba_metrics.py confronta CORR con numpy.corrcoef su
+    dati a 2 e 3 dimensioni e controlla che resti fra -1 e 1.
+
+
+-------------------------------------------------------------------------------
+2. MODULI DI S-MAMBA COSTRUITI E MAI USATI
+-------------------------------------------------------------------------------
+
+ERRORE
+    Ogni layer dell'encoder di S-Mamba creava tre moduli in piu' (due
+    blocchi Mamba con d_model=11 e un layer di attention) che non venivano
+    mai usati nel calcolo. Conseguenze:
+      - parametri inutili nel modello e nei checkpoint;
+      - consumavano numeri casuali all'inizializzazione, cambiando i pesi
+        iniziali degli altri moduli;
+      - obbligavano a importare SelfAttention_Family.py e con lui le librerie
+        reformer_pytorch ed einops, che il modello non usa.
+    Il codice era identico a quello ufficiale degli autori di S-Mamba, che
+    contiene lo stesso residuo.
+
+CODICE (src/model/mamba/layers/Mamba_EncDec.py, EncoderLayer.__init__, prima)
+
+    self.man = Mamba(
+        d_model=11,  # Model dimension d_model
+        d_state=16,  # SSM state expansion factor
+        d_conv=2,  # Local convolution width
+        expand=1,  # Block expansion factor)
+    )
+    self.man2 = Mamba(
+        d_model=11,  # Model dimension d_model
+        d_state=16,  # SSM state expansion factor
+        d_conv=2,  # Local convolution width
+        expand=1,  # Block expansion factor)
+    )
+    self.a = AttentionLayer(
+                    FullAttention(False, 2, attention_dropout=0.1,
+                                  output_attention=True), 11,1)
+
+SOLUZIONE
+    Rimossi i tre moduli e l'import di SelfAttention_Family. Il calcolo del
+    modello non cambia: a parita' di pesi, la versione corretta e quella
+    ufficiale danno uscite identiche (differenza 0).
+
+    Verifica: tests/test_mamba_models.py::test_every_parameter_receives_a_gradient
+    controlla che ogni parametro del modello partecipi al calcolo.
+
+
+-------------------------------------------------------------------------------
+3. PATCHMIXER USAVA LO STRIDE SBAGLIATO
+-------------------------------------------------------------------------------
+
+ERRORE
+    PatchMixer taglia la serie in "patch" (pezzi) e il passo fra un pezzo e
+    l'altro e' il patch stride. Il codice pero' leggeva configs.stride, che
+    nel repo era il passo fra una finestra di dati e la successiva (default 1),
+    non il patch stride. Conseguenze:
+      - il parametro --patch_stride degli script era ignorato: le patch
+        venivano sempre tagliate con passo 1;
+      - la vecchia grid search, variando "stride", cambiava insieme le patch
+        e le finestre dei dati.
+
+CODICE (src/model/mamba/PatchMixer.py, Backbone.__init__, prima)
+
+    self.stride = configs.stride
+
+SOLUZIONE
+    Si legge il parametro giusto, che ora sta nel config come
+    model.params.patch_stride:
+
+    self.stride = configs.patch_stride
+
+    Verifica: tests/test_mamba_models.py::test_patchmixer_cuts_patches_with_patch_stride
+    controlla, per diversi valori, che numero e passo delle patch seguano
+    patch_stride.
+
+
+-------------------------------------------------------------------------------
+4. MAPE E MSPE DIVIDEVANO PER ZERO
+-------------------------------------------------------------------------------
+
+ERRORE
+    MAPE (errore percentuale assoluto medio) e MSPE (errore percentuale
+    quadratico medio) dividono l'errore per il valore vero. Quando il valore
+    vero e' 0 il risultato e' infinito, e basta un solo zero per rendere
+    infinita tutta la media. Nel meteo di EarthNet succede di continuo: la
+    pioggia vale 0 nella maggior parte dei giorni. Inoltre metric(), che
+    calcolava tutte le metriche insieme, le includeva sempre.
+
+CODICE (src/utils/metrics.py, prima)
+
+    def MAPE(pred, true):
+        return np.mean(np.abs((pred - true) / true))
+
+
+    def MSPE(pred, true):
+        return np.mean(np.square((pred - true) / true))
+
+
+    def metric(pred, true):
+        mae = MAE(pred, true)
+        mse = MSE(pred, true)
+        rmse = RMSE(pred, true)
+        mape = MAPE(pred, true)
+        mspe = MSPE(pred, true)
+
+        return mae, mse, rmse, mape, mspe
+
+SOLUZIONE
+    Rimosse MAPE e MSPE. metric() restituisce solo le tre metriche che
+    funzionano con qualunque valore, nelle unita' dei dati:
+
+    def metric(pred, true):
+        mae = MAE(pred, true)
+        mse = MSE(pred, true)
+        rmse = RMSE(pred, true)
+
+        return mae, mse, rmse
+
+    Verifica: tests/test_mamba_metrics.py::test_metric_returns_mae_mse_rmse
+    controlla che metric() restituisca esattamente MAE, MSE e RMSE.

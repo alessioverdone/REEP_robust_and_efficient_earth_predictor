@@ -254,3 +254,38 @@ def setup_autoencoder_runtime(cfg: TrainCfg,
                    f"latent_channels={cfg.autoencoder.latent_channels} | "
                    f"block_out_channels={list(cfg.autoencoder.block_out_channels)}")
     return AutoencoderRuntime(device=device, datenow=outputs.timestamp)
+
+
+# =========================== CONDITION PREDICTOR ===========================
+# Torch puro come la fase 1: device, timestamp e tracker.
+
+@dataclass
+class ConditionRuntime:
+    device: torch.device
+    datenow: str
+    # live report on W&B, see Runtime.tracker
+    tracker: Tracker = field(default_factory=Tracker)
+
+
+def setup_condition_runtime(cfg: TrainCfg,
+                            outputs: RunOutputs) -> ConditionRuntime:
+    """
+    Device, seed, TF32 and file logging for the training of the Condition
+    Predictor. The log goes to the run's artifacts/ and the timestamp is the
+    run folder's name.
+    """
+    cond_logger = logging.getLogger(__name__)
+
+    _basic_logging()
+    cond_logger.info(f"Log del run in {_add_log_file(outputs.log_file)}")
+
+    set_seed(cfg.run.seed)
+    if cfg.run.allow_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cond = cfg.condition
+    cond_logger.info(f"[condition] device={device} | seed={cfg.run.seed} | model={cond.model.name} | "
+                     f"{cond.n_context} -> {cond.n_predict} frames x {cond.n_channels} variables | "
+                     f"meso_agg={cond.meso_agg}")
+    return ConditionRuntime(device=device, datenow=outputs.timestamp)

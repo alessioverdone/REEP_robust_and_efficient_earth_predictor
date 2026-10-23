@@ -206,6 +206,48 @@ class AutoencoderState:
 HIGHER_IS_BETTER = ("psnr", "ssim")
 
 
+# ======================== CONDITION PREDICTOR (MAMBA) ========================
+
+@dataclass
+class ConditionState:
+    """
+    Where the training of the Condition Predictor is: the same role as
+    AutoencoderState, with the validation loss as the selection criterion.
+    """
+
+    start_epoch: int = 0
+    global_step: int = 0                    # training batches seen so far
+    best_metric: float = float("inf")       # lowest val_loss so far
+    history_csv: str = ""
+    metrics: TrainMetrics = field(default_factory=TrainMetrics)
+
+    # What training_info.json reports. `static` is filled once at start (run,
+    # dataset, model, FLOPs); the rest advances with the loop.
+    static: dict = field(default_factory=dict)
+    status: str = "running"                 # running | completed | failed | interrupted
+    error: Optional[str] = None
+    started_at: str = ""
+    ended_at: Optional[str] = None
+    epochs_completed: int = 0
+    best_epoch: Optional[int] = None        # 1-based, as in history.csv
+    train_metrics: dict = field(default_factory=dict)       # last epoch
+    val_metrics: dict = field(default_factory=dict)         # last epoch
+    best_val_metrics: dict = field(default_factory=dict)
+    # the same metrics for the simple forecasts (persistence, context mean) on
+    # the validation set: the model has to beat them
+    baselines: dict = field(default_factory=dict)
+    epoch_seconds: list = field(default_factory=list)       # training only, per epoch
+    cubes_per_second: list = field(default_factory=list)    # training throughput, per epoch
+    lr_reductions: list = field(default_factory=list)       # [{"epoch", "lr"}]
+    # early stopping: reference value and epochs since it last improved by more than min_delta
+    early_stop_reference: float = float("inf")
+    epochs_without_improvement: int = 0
+    stopped_early: bool = False
+    # best weights on CPU: the final validation uses them also when no checkpoint is saved
+    best_state_dict: Optional[dict] = None
+    checkpoints: dict = field(default_factory=dict)         # file name -> info
+
+
 def monitored_value(val_metrics: dict, save_best_by: str) -> float:
     """Valore da confrontare con best_metric, orientato al minimo."""
     value = float(val_metrics[save_best_by])
