@@ -27,7 +27,11 @@ uv venv "$VENV" --python=3.10
 
 # --python punta uv al venv giusto senza doverlo attivare; dentro al venv non
 # c'e' pip (uv venv non lo installa), quindi si usa sempre `uv pip`.
-PIP="uv pip install --python $VENV/bin/python"
+#PRE-MAMBA
+#PIP="uv pip install --python $VENV/bin/python"
+#printf "torch==2.8.0\ntorchvision==0.23.0\n" > "$VENV/torch-pin.txt"
+printf "torch==2.8.0\ntorchvision==0.23.0\nboto3>=1.34\nbotocore>=1.34\n" > "$VENV/torch-pin.txt"
+PIP="uv pip install --python $VENV/bin/python -c $VENV/torch-pin.txt"
 
 # PyTorch prima e da solo, dal suo indice: le wheel cu128 sono le prime con i
 # kernel sm_120 (Blackwell / RTX 50xx). L'indice di PyTorch NON va lasciato
