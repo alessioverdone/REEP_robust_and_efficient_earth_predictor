@@ -318,7 +318,28 @@ def load_meso_dynamic(
     """
     with np.load(path) as z:
         md = z[MESO_DYNAMIC_KEY]
+    return aggregate_meso(md, n_channels=n_channels, n_time=n_time,
+                          steps_per_frame=steps_per_frame, center_crop=center_crop,
+                          agg=agg, source=path)
 
+
+def aggregate_meso(
+    md: np.ndarray,
+    n_channels: int = 5,
+    n_time: int = 30,
+    steps_per_frame: int = 5,
+    center_crop: int = 2,
+    agg: str = "last",
+    source: Any = MESO_DYNAMIC_KEY,
+) -> np.ndarray:
+    """
+    The computation of load_meso_dynamic on an array already in memory:
+    mesodynamic (H, W, C, T_daily) -> (n_time, n_channels) float32. It serves
+    the cubes whose weather is split in two files (context and target of the
+    EarthNet test splits, see src/dataset/meso_series.py). `source` only names
+    the array in the error messages.
+    """
+    path = source
     if md.ndim != 4:
         raise ValueError(f"{path}: {MESO_DYNAMIC_KEY} shape inattesa {md.shape}")
     if md.shape[2] < n_channels:

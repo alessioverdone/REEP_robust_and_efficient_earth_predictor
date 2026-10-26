@@ -1,0 +1,40 @@
+# Optuna sweep over the Condition Predictor (Mamba), see sweep_diffusion_0.yaml.
+# Every trial is one run of run_condition_train.py; results in
+# registry/outputs/sweeps/<name>/ (trials.csv, best.json). The weather series are
+# extracted once, before the first trial, if missing.
+#
+# The sizes in configuration_0.yaml are only a starting point: this study
+# chooses them on the validation set (val_loss, the MSE of the normalized
+# weather). The test splits are evaluated afterwards, once, on the chosen model
+# (src/scripts/evaluate_condition.py).
+
+name: condition_s_mamba_0
+phase: condition
+mode: train
+base_config: [configuration_0.yaml]
+metric: val_loss                # val_loss | val_rmse | val_mae | val_rmse_<variable> (minimize)
+direction: minimize
+n_trials: 40
+sampler: tpe
+seed: 0
+n_startup_trials: 10
+
+pruning:
+  enabled: true
+  n_startup_trials: 5
+  n_warmup_steps: 10            # epochs of a trial before it can be pruned
+  interval_steps: 1
+
+fixed:
+  condition.num_epochs: 60
+  condition.early_stopping_patience: 10
+  condition.examples_every: 20
+
+params:
+  condition.model.params.d_model: {type: categorical, choices: [32, 64, 128, 256]}
+  condition.model.params.d_ff: {type: categorical, choices: [64, 128, 256, 512]}
+  condition.model.params.e_layers: {type: int, low: 1, high: 3}
+  condition.model.params.d_state: {type: categorical, choices: [8, 16, 32]}
+  condition.model.params.dropout: {type: float, low: 0.0, high: 0.3}
+  condition.model.params.use_norm: {type: categorical, choices: [true, false]}
+  condition.lr: {type: float, low: 1.0e-4, high: 3.0e-3, log: true}

@@ -79,3 +79,12 @@ optuna>=4                 # src/training/sweep.py (hyperparameter search)
 # il solo training puo' farne a meno.
 earthnet
 scikit-image              # structural_similarity: la SSIM dell'ENS (importata direttamente)
+
+# ---- Condition Predictor (Mamba) ----
+# S-Mamba usa i kernel CUDA di mamba-ssm (e causal-conv1d, opzionale ma piu'
+# veloce), che si compilano contro il torch installato: li installa setup_env.sh
+# DOPO questo file, con --no-build-isolation. Servono nvcc e una GPU NVIDIA.
+# Senza, i test girano lo stesso (tests/stubs/) e PatchMixer resta utilizzabile.
+#   causal-conv1d
+#   mamba-ssm
+pytest                    # tests/

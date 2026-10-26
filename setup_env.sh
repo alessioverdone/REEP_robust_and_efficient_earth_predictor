@@ -27,7 +27,11 @@ uv venv "$VENV" --python=3.10
 
 # --python punta uv al venv giusto senza doverlo attivare; dentro al venv non
 # c'e' pip (uv venv non lo installa), quindi si usa sempre `uv pip`.
-PIP="uv pip install --python $VENV/bin/python"
+#PRE-MAMBA
+#PIP="uv pip install --python $VENV/bin/python"
+#printf "torch==2.8.0\ntorchvision==0.23.0\n" > "$VENV/torch-pin.txt"
+printf "torch==2.8.0\ntorchvision==0.23.0\nboto3>=1.34\nbotocore>=1.34\n" > "$VENV/torch-pin.txt"
+PIP="uv pip install --python $VENV/bin/python -c $VENV/torch-pin.txt"
 
 # PyTorch prima e da solo, dal suo indice: le wheel cu128 sono le prime con i
 # kernel sm_120 (Blackwell / RTX 50xx). L'indice di PyTorch NON va lasciato
@@ -42,6 +46,17 @@ $PIP torch==2.8.0 torchvision==0.23.0 \
 # torch==2.8.0 del file, quindi non viene reinstallato.
 echo ">>> Installo le altre dipendenze da requirements.txt..."
 $PIP -r requirements.txt
+
+# Kernel CUDA di Mamba per il Condition Predictor (passo 3b del README): si
+# compilano contro il torch appena installato, quindi dopo e senza build
+# isolation. Se la compilazione fallisce (niente nvcc) l'ambiente resta valido
+# per le altre fasi: S-Mamba non si potra' addestrare finche' non si installano.
+# Senza build isolation gli strumenti di compilazione devono essere gia' nel venv:
+# uv venv non li installa (setuptools, wheel, packaging, ninja).
+echo ">>> Installo i kernel di Mamba (causal-conv1d, mamba-ssm)..."
+$PIP setuptools wheel packaging ninja
+$PIP causal-conv1d mamba-ssm --no-build-isolation \
+    || echo "ATTENZIONE: mamba-ssm non installato (serve nvcc / CUDA): S-Mamba non disponibile, i test lo segnalano (mamba_ssm: CPU stand-in)"
 
 echo ""
 echo ">>> Verifica: torch, GPU e import della pipeline"

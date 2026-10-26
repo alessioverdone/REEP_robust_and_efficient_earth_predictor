@@ -69,6 +69,42 @@ autoencoder:
   prefetch_factor: 2
   persistent_workers: true
 
+# Condition Predictor (Mamba): forecasts the weather of the 20 target frames from
+# the 10 context frames (src/scripts/run_condition_train.py). T, n_predict, n_context,
+# n_channels, steps_per_frame and center_crop are derived from data.params: the
+# same frames and cells the DiT reads. series_dir and outputs_dir are derived from paths.
+condition:
+  meso_agg: mean              # days of a frame -> one value; the DiT reads data.params.meso_agg
+  variables: [precipitation, sea_pressure, mean_temperature, min_temperature, max_temperature]
+  test_splits: [iid, ood]     # extracted too, when data/raw/<split>_test_split exists
+  extract_workers: 8
+  model:
+    name: S_Mamba             # S_Mamba | PatchMixer
+    params:
+      d_model: 64
+      d_state: 16
+      d_conv: 2
+      expand: 1
+      d_ff: 128
+      e_layers: 2
+      dropout: 0.1
+      activation: gelu
+      use_norm: true
+  batch_size: 256
+  num_workers: 0
+  num_epochs: 100
+  lr: 1e-3
+  weight_decay: 1e-4
+  grad_clip_norm: 1.0
+  lr_scheduler_factor: 0.5
+  lr_scheduler_patience: 5
+  early_stopping_patience: 15 # 0 = off
+  early_stopping_min_delta: 0.0
+  save_checkpoints: true      # best.pt and last.pt
+  n_examples: 4               # validation cubes in results/forecasts/val_epoch_XXX.png, 0 = none
+  examples_every: 5
+  pretrained_path: latest     # for phase 2: best.pt of the latest condition run on this dataset, or a path
+
 diffusion:
   scale_factor: null          # null = read from the VAE checkpoint (measured by phase 1)
   # shift_scale:             z = (z_vae - shift_factor) * scale_factor

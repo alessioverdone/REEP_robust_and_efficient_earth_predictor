@@ -49,6 +49,7 @@ from omegaconf import OmegaConf
 
 from src.config import PROJECT_DIR, TrainCfg, load_config, project_path, resolve_config_path, use_project_dir
 from src.dataset.dataset_info import load_dataset_info
+from src.dataset.meso_series import ensure_series
 from src.model.diffusion_utils import resolve_first_stage_path
 from src.training.run_outputs import relative_to_project
 
@@ -81,7 +82,7 @@ class PruningCfg:
 @dataclass
 class SweepCfg:
     name: str = ""                                      # the study, and its folder under outputs_dir
-    phase: str = "diffusion"                            # autoencoder | diffusion
+    phase: str = "diffusion"                            # autoencoder | condition | diffusion
     # train: every trial trains a model. validate_only (diffusion): every trial
     # validates the weights of `checkpoint`, for parameters that need no
     # training (sampler, guider)
@@ -97,8 +98,8 @@ class SweepCfg:
     n_startup_trials: int = 10                          # tpe: random trials before the model kicks in
     multivariate: bool = True                           # tpe: model the parameters jointly
     outputs_dir: str = "registry/outputs/sweeps"
-    # command before the script; null = python for the autoencoder,
-    # `python -m accelerate.commands.launch` (accelerate launch) for diffusion
+    # command before the script; null = python for the autoencoder and the
+    # condition predictor, `python -m accelerate.commands.launch` (accelerate launch) for diffusion
     launcher: Optional[list[str]] = None
     poll_seconds: int = 30                              # how often history.csv is read
     stop_timeout_seconds: int = 600                     # after SIGINT, wait this long before SIGKILL
@@ -106,17 +107,18 @@ class SweepCfg:
     fixed: dict[str, Any] = field(default_factory=dict)       # dotlist key -> value, for every trial
     params: dict[str, ParamCfg] = field(default_factory=dict)  # dotlist key -> search space
 
-    PHASES: ClassVar[tuple[str, ...]] = ("autoencoder", "diffusion")
+    PHASES: ClassVar[tuple[str, ...]] = ("autoencoder", "condition", "diffusion")
     MODES: ClassVar[tuple[str, ...]] = ("train", "validate_only")
     DIRECTIONS: ClassVar[tuple[str, ...]] = ("minimize", "maximize")
     SAMPLERS: ClassVar[tuple[str, ...]] = ("tpe", "random")
     SCRIPTS: ClassVar[dict[str, str]] = {"autoencoder": "src/scripts/run_autoencoder_train.py",
+                                         "condition": "src/scripts/run_condition_train.py",
                                          "diffusion": "src/scripts/run_diffusion_train.py"}
     # keys the sweep sets itself for every trial
     MANAGED_KEYS: ClassVar[tuple[str, ...]] = ("run.project_name", "run.cfgdir", "run.set",
                                                "run.validate_only", "run.resume_from_checkpoint",
-                                               "autoencoder.outputs_dir", "diffusion.outputs_dir",
-                                               "wandb.tags")
+                                               "autoencoder.outputs_dir", "condition.outputs_dir",
+                                               "diffusion.outputs_dir", "wandb.tags")
     # fields that may change between two launches of the same study
     RESUMABLE_FIELDS: ClassVar[tuple[str, ...]] = ("n_trials", "launcher", "poll_seconds",
                                                    "stop_timeout_seconds")
@@ -172,6 +174,9 @@ def validate_sweep(sweep: SweepCfg):
         if sweep.phase == "diffusion" and key.startswith("autoencoder."):
             errors.append(f"{key}: a diffusion sweep uses one VAE for every trial, its "
                           f"architecture cannot change")
+        if sweep.phase == "condition" and (key.startswith("data.") or key == "condition.meso_agg"):
+            errors.append(f"{key}: a condition sweep reads the weather series extracted once "
+                          f"for every trial, how they are built cannot change")
 
     for key, param in sweep.params.items():
         if param.type not in ParamCfg.TYPES:
@@ -237,14 +242,18 @@ def check_inputs(sweep: SweepCfg,
                  cfg: TrainCfg) -> dict:
     """
     The checkpoint of validate_only and the preprocessed dataset the trials
-    read must already exist. Returns the dataset.json.
+    read must already exist. For the condition phase the weather series are
+    extracted here, once, if missing: never inside a trial. Returns the dataset.json.
     """
     if sweep.mode == "validate_only" and not project_path(sweep.checkpoint).is_dir():
         raise SystemExit(f"checkpoint: {sweep.checkpoint} is not a folder (e.g. "
                          f"registry/outputs/diffusion/<run>/checkpoints/best)")
     dataset_json = (cfg.autoencoder.dataset_json if sweep.phase == "autoencoder"
                     else cfg.data.params.dataset_json)
-    return load_dataset_info(dataset_json)
+    dataset = load_dataset_info(dataset_json)
+    if sweep.phase == "condition":
+        ensure_series(cfg)
+    return dataset
 
 
 def pin_first_stage(sweep: SweepCfg,
@@ -301,7 +310,7 @@ def suggest_value(trial: optuna.Trial,
 def trial_command(sweep: SweepCfg,
                   overrides: list[str]) -> list[str]:
     launcher = (list(sweep.launcher) if sweep.launcher is not None
-                else [sys.executable] if sweep.phase == "autoencoder"
+                else [sys.executable] if sweep.phase in ("autoencoder", "condition")
                 else [sys.executable, "-m", "accelerate.commands.launch"])
     command = [*launcher,
                SweepCfg.SCRIPTS[sweep.phase],

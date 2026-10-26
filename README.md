@@ -5,6 +5,9 @@ Repository principale del modello *"REEP: Robust and Efficient Earth Predictor"*
 Il modello predice l'evoluzione futura di minicubi Sentinel-2 (EarthNet2021):
 20 frame predetti a partire da 10 di contesto, con un diffusion model che lavora
 nello spazio latente di un autoencoder addestrato separatamente e poi congelato.
+Un Condition Predictor (Mamba), addestrato anche lui a parte, prevede il meteo
+dei frame futuri, così il diffusion model può essere condizionato su una
+previsione invece che sul meteo futuro osservato (passo 3b).
 
 ---
 
@@ -109,6 +112,97 @@ By default phase 2 loads `pretrained_path: latest`, the `best.pt` of the most
 recent completed run trained on the same dataset at the same resolution. To use
 a specific one: `--set diffusion.first_stage_config.pretrained_path=registry/outputs/autoencoder/<run>/checkpoints/best.pt`.
 `registry/` is git-ignored except `registry/configurations/`.
+
+### 3b. Condition Predictor (Mamba) — `src/scripts/run_condition_train.py`
+
+Mamba prevede il meteo dei 20 frame futuri a partire da quello dei 10 frame di
+contesto. Nella fase 2 il DiT può essere condizionato su questa previsione
+invece che sul meteo futuro osservato: è lo schema di DF-Diff, con il blocco
+*Condition Predictor* e il "Pretrained Mamba". Si addestra da solo, dopo il
+preprocessing (non dipende dalla fase 1), e poi si congela.
+
+```bash
+python src/dataset/meso_series.py                                         # una volta: estrae il meteo dai cubi
+python src/scripts/run_condition_train.py --project_name mamba_v1
+python src/scripts/evaluate_condition.py --model latest --split iid ood   # alla fine, una volta sola
+```
+
+**Dal cubo alla serie.** In un cubo il meteo (`mesodynamic`) è una griglia di
+80×80 celle da 1,28 km, con 5 variabili (pioggia, pressione, temperatura media,
+minima e massima) e un valore al giorno. `src/dataset/meso_series.py` lo riduce a
+un valore per frame e per variabile con lo stesso codice del dataloader del DiT
+(`load_meso_dynamic`). Le due medie si fanno variabile per variabile:
+
+1. **media spaziale** delle 4 celle centrali (2×2, cioè 2,56 km, l'area
+   dell'immagine satellitare), come per il DiT;
+2. **media temporale** dei 5 giorni di ogni frame (`condition.meso_agg: mean`),
+   cioè il meteo accumulato nel periodo. Il DiT oggi prende invece il solo
+   giorno della foto (`data.params.meso_agg: last`). Con la pioggia
+   `0, 0, 12, 0, 0` mm il giorno della foto dà 0, la media 2,4 mm/giorno.
+
+Mamba legge quindi una tabella **10 × 5** e ne prevede una **20 × 5**: prima la
+media, poi la previsione. Prevedere le medie dà lo stesso risultato atteso che
+prevedere i giorni singoli e poi mediarli, ma è un bersaglio molto meno
+rumoroso.
+
+**Dati e cartelle.**
+- Cubi e split sono quelli di `dataset.json`.
+- Vengono estratti anche gli split di test di `condition.test_splits`, quando
+  `data/raw/<split>_test_split/` esiste.
+- Tutto finisce in `data/preprocessed/<name>/condition_<meso_agg>/`:
+  - `<split>.npz`: le serie;
+  - `stats.json`: min e max sul train, cioè la normalizzazione in [-1, 1] di
+    `cond_stats.json`, con valori identici quando l'aggregazione coincide;
+  - `series.json`: parametri, id del dataset e cubi scartati.
+- Se le serie mancano, l'estrazione parte da sola al primo training. Se sono
+  state estratte con altri parametri, il lancio si ferma: si rifanno con
+  `--overwrite`.
+
+**Il modello.** S-Mamba (`src/model/mamba/`), cioè l'implementazione ufficiale
+ripulita dai moduli inutilizzati: le correzioni sono descritte in
+`src/model/mamba/errori_corretti.txt`. In alternativa si può usare PatchMixer,
+scelto con `condition.model.name`.
+- La loss è la MSE sul meteo normalizzato, così le 5 variabili pesano allo
+  stesso modo.
+- Le dimensioni della rete in `configuration_0.yaml` sono solo un punto di
+  partenza: si scelgono con lo sweep `sweep_condition_0.yaml` sulla validazione.
+
+Ogni run scrive solo nella sua cartella, con la stessa struttura delle altre fasi:
+
+```
+registry/outputs/condition/<YYYY-MM-DD_HH-MM-SS>/
+  artifacts/      config, training_info.json, history.csv (train_loss, val_loss,
+                  val_rmse, val_rmse_<variabile>, ...), train.log
+  checkpoints/    best.pt e last.pt: pesi + architettura + normalizzazione + id del dataset
+  results/
+    curves/       loss, lr, rmse_by_lead (modello e baseline per frame di anticipo)
+    forecasts/    epoch_XXX/val.png ogni condition.examples_every epoche, final.png
+    statistics/   metrics_val.json (fine training), metrics_<split>.json (evaluate_condition.py)
+```
+
+**Valutazione.**
+- Ogni valutazione confronta il modello con due baseline: la **persistenza**
+  (l'ultimo frame ripetuto) e la **media del contesto**.
+- Gli errori sono riportati sia normalizzati sia, variabile per variabile, nelle
+  unità dei cubi.
+- Gli split di test si valutano una volta sola, sul modello già scelto. Extreme
+  (20 + 40) e seasonal (70 + 140) hanno orizzonti più lunghi di 10 → 20 e
+  richiedono un rollout, non ancora implementato.
+
+**Collegamento con la fase 2.** `load_condition_predictor(cfg)`, in
+`src/model/condition_utils.py`, carica `condition.pretrained_path`. Con `latest`
+prende l'ultimo run completato sullo stesso dataset e con le stesse serie, come
+per il VAE. Poi lo congela e, dato il meteo `(B, 30, 5)` come lo legge il DiT,
+restituisce lo stesso tensore con i 20 frame futuri sostituiti dalla
+previsione.
+- Prima di tutto controlla che il DiT legga il meteo nel modo in cui Mamba è
+  stato addestrato: stesso dataset, stessi frame, stesso `meso_agg`, stessa
+  normalizzazione. Se no, si ferma.
+- Per usarlo va quindi impostato `data.params.meso_agg: mean`, e il DiT va
+  riaddestrato con quel meteo.
+- Il passo successivo è usarlo dentro la fase 2. L'esperimento chiave di
+  DF-Diff è condizionare il DiT una volta con il meteo osservato e una volta con
+  quello previsto.
 
 ### 4. Fase 2 — diffusion: `src/scripts/run_diffusion_train.py`
 
@@ -283,11 +377,13 @@ data/
   raw/                     minicubi .npz di EarthNet -- SOLA LETTURA
   preprocessed/<name>/     one folder per preprocessed dataset (dataset.json, stats,
                            cond_stats, .npy, manifest, config.yaml, log)
+    condition_<meso_agg>/  serie del meteo del Condition Predictor (passo 3b)
 
 registry/
   configurations/          i yaml di configurazione (configuration_0.yaml)
   checkpoints/             checkpoints promoted by hand (the ones in regular use)
   outputs/autoencoder/     one folder per phase-1 run (see step 3)
+  outputs/condition/       one folder per Condition Predictor run (see step 3b)
   outputs/diffusion/       one folder per phase-2 run (see step 4)
   outputs/sweeps/<name>/   one folder per hyperparameter search (see below)
 
@@ -296,10 +392,13 @@ src/
                            di tutto: qui si leggono e si cambiano i parametri
   dataset/                 download, preprocessing, dataset del VAE
     dataset_info.py        dataset.json: split lists and dataset id, read by both phases
+    meso_series.py         passo 3b: serie del meteo per cubo, normalizzazione, dataset
   model/                   architetture e funzioni delle due fasi
     sgm/                   DiT, sampler, denoiser, loss (da Stable Diffusion)
+    mamba/                 S-Mamba e PatchMixer (Condition Predictor), errori_corretti.txt
     diffusion_utils.py     fase 2: modelli, dataloader, training loop
     autoencoder_utils.py   fase 1: costruzione del VAE, checkpoint, metriche
+    condition_utils.py     passo 3b: modello, checkpoint, load_condition_predictor per la fase 2
   training/
     runtime.py             Runtime: accelerator, dtype, logging, device, W&B tracker
     state.py               TrainState / TrainMetrics: progresso e misure del run
@@ -307,11 +406,18 @@ src/
     tracking.py            live report on Weights & Biases (wandb section)
     sweep.py               hyperparameter search with Optuna over the run scripts
     train_autoencoder.py   fase 1: dati, modello, loop
+    train_condition.py     passo 3b: dati, modello, loop, valutazione con le baseline
   scripts/
     run_autoencoder_train.py   punto d'ingresso fase 1
+    run_condition_train.py     punto d'ingresso passo 3b
+    evaluate_condition.py      passo 3b: valutazione sugli split di test
     run_diffusion_train.py     punto d'ingresso fase 2
     measure_latent_stats.py    adds the per-channel latent stats to an older VAE run
     run_sweep.py               entry point of a hyperparameter search
+  utils/
+    metrics.py             MAE, MSE, RMSE, RSE, CORR (passo 3b)
+
+tests/                     test (python -m pytest), con cubi EarthNet sintetici
 
 other/                     legacy code and references, not maintained (old trainer,
                            MAE first stage, old configs, old requirements)
@@ -366,6 +472,7 @@ aware of the sweep. Trials run one at a time.
 |---|---|
 | `sweep_diffusion_0.yaml` | phase 2, trains every trial: lr, warmup, DiT depth / hidden_size / heads, MinSNR gamma, past_weight |
 | `sweep_autoencoder_0.yaml` | phase 1: lr, weight decay, batch size, block_out_channels, layers_per_block |
+| `sweep_condition_0.yaml` | step 3b: S-Mamba d_model, d_ff, e_layers, d_state, dropout, use_norm, lr (series extracted once, before the trials) |
 | `sweep_sampling_0.yaml` | phase 2, `mode: validate_only`: sampler steps and CFG scale on a trained `checkpoint`, no training |
 
 The keys of a sweep:
@@ -429,6 +536,23 @@ Selection uses validation metrics only. Re-train the best configuration
 at full scale (more epochs, full dataset) before reporting it. Every
 phase-2 trial keeps `checkpoints/best` and one final `checkpoint-<step>`:
 delete the trial folders you no longer need.
+
+## Test
+
+```bash
+python -m pytest
+```
+
+I test costruiscono un piccolo dataset EarthNet sintetico, ci fanno girare il
+preprocessing vero e verificano la catena del Condition Predictor:
+- configurazione;
+- estrazione del meteo, confrontata valore per valore con la definizione;
+- addestramento dei due modelli, checkpoint e valutazione;
+- sweep e caricamento nella fase 2;
+- i modelli Mamba e le metriche.
+
+`mamba-ssm` gira solo su GPU NVIDIA. Senza, i test usano un sostituto CPU
+(`tests/stubs/`) e saltano solo il test con i kernel veri, segnato `cuda`.
 
 ## Note
 
