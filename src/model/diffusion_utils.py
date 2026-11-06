@@ -975,6 +975,96 @@ def log_videos_local_and_wandb(
     return validate_log, batch_sums, forecast
 
 
+def sample_forecast(batch,
+                    context,
+                    model,
+                    conditioner,
+                    first_stage_model,
+                    sampler,
+                    denoiser,
+                    config_diffusion,
+                    noise_image_num,
+                    past_weigth,
+                    n_samples=1,
+                    first_stage_chunk=32):
+    """
+    K = n_samples forecasts of the frames after `context`, for inference (test evaluation,
+    evaluate_ens.py). The same procedure as log_videos_local_and_wandb (VAE encode of the
+    context, initial noise mixed with the context mean, sampler with CFG, VAE decode), and
+    the same numbers for the same random draws, without what only the validation of the
+    training needs:
+
+    - only the context frames are encoded (not the target ones, which are used there for
+      the latent RMSEs), once for all the K samples; the same for the conditioner;
+    - the "reconstructions" of all the frames are not decoded, only the predicted ones;
+    - no RMSE sums, no baselines, no per-lead-time statistics;
+    - the K samples are drawn one after the other from the same encoded context, so the
+      memory is the one of a single sample;
+    - the VAE encodes and decodes `first_stage_chunk` frames at a time: every frame goes
+      through it on its own, so the result is the same, and the memory of the long
+      sequences (140 frames to decode for seasonal) stays bounded.
+
+    batch      only the conditioning keys of the conditioner are read (here
+               meso_condition_image and highres_condition_image); the weather must cover
+               context + forecast frames (image_time_length)
+    context    (B, n_context, C, H, W) in [-1, 1], on the device, in the weight dtype
+    returns    a list of K tensors (B, noise_image_num, C, H, W) in [-1, 1], on the device
+    """
+    device = context.device
+    weight_dtype = context.dtype
+    B, n_context, C, H, W = context.shape
+
+    def encode_context(x):
+        fs_dtype = _module_dtype(first_stage_model)
+        z = torch.cat([first_stage_model.encode(part.to(fs_dtype)).latent_dist.mean
+                       for part in x.split(first_stage_chunk)])
+        return normalize_latents(z, config_diffusion).to(device, dtype=weight_dtype)
+
+    def decode(z):
+        fs_dtype = _module_dtype(first_stage_model)
+        outs = []
+        for part in denormalize_latents(z, config_diffusion).split(first_stage_chunk):
+            out = first_stage_model.decode(part.to(fs_dtype))
+            outs.append(out if torch.is_tensor(out) else out.sample)
+        return torch.cat(outs).to(weight_dtype)
+
+    model.eval()
+    conditioner.eval()
+    with torch.no_grad():
+        keys = [e.input_key for e in conditioner.embedders]
+        c, uc = conditioner.get_unconditional_conditioning(
+            batch, force_uc_zero_embeddings=keys if len(conditioner.embedders) > 0 else [])
+        for k in c:
+            if isinstance(c[k], torch.Tensor):
+                c[k], uc[k] = map(lambda y: y[k].to(device, dtype=weight_dtype), (c, uc))
+            elif isinstance(c[k], list):
+                for i in range(len(c[k])):
+                    c[k][i] = c[k][i].to(device, dtype=weight_dtype)
+                    uc[k][i] = uc[k][i].to(device, dtype=weight_dtype)
+
+        z = encode_context(context.reshape(B * n_context, C, H, W))
+        _, C_, H_, W_ = z.shape
+        past_images = z.view(B, n_context, C_, H_, W_)
+        past_mean = torch.mean(past_images, dim=1, keepdim=True)                 # b,1,c,h,w
+        mixed_past = rearrange(past_mean.repeat(1, noise_image_num, 1, 1, 1),
+                               "b t c h w -> b (t c) h w").contiguous()          # b,t*c,h,w
+
+        denoiser_func = lambda input, sigma, c, past_images: denoiser(
+            model, past_images, input, sigma, c)
+        forecasts = []
+        for _ in range(n_samples):
+            noise = torch.randn(B, noise_image_num * C_, H_, W_).to(device, dtype=weight_dtype)
+            noise = past_weigth * mixed_past + (1 - past_weigth) * noise
+            latent = sampler(denoiser_func, noise, c, uc=uc, past_images=past_images,
+                             noise_image_num=noise_image_num, past_mean=mixed_past,
+                             past_weigth=past_weigth)
+            latent = rearrange(latent, "b (t c) h w -> (b t) c h w",
+                               t=noise_image_num).contiguous().to(device, dtype=weight_dtype)
+            forecasts.append(torch.clamp(decode(latent).view(B, noise_image_num, C, H, W),
+                                         -1.0, 1.0))
+    return forecasts
+
+
 def validation_loss(loss_fn,
                     model,
                     denoiser,

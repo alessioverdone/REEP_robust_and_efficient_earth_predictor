@@ -231,7 +231,23 @@ def load_highres_dynamic(
     """
     with np.load(path) as z:
         hd = z[HIGHRES_DYNAMIC_KEY]
+    return highres_dynamic_from_array(hd, path, n_bands=n_bands, n_time=n_time)
 
+
+def highres_dynamic_from_array(
+    hd: np.ndarray,
+    source: Any,
+    n_bands: int = 4,
+    n_time: int = 30,
+) -> Tuple[np.ndarray, int]:
+    """
+    The computation of load_highres_dynamic on an array already in memory:
+    highresdynamic (H, W, C, T) -> (T, n_bands, H, W) float32 and the number of values
+    fill_spatial could not fill. It serves the cubes read from two files (context and
+    target of the EarthNet test splits, see src/dataset/test_cubes.py). `source` only
+    names the array in the error messages.
+    """
+    path = source
     if hd.ndim != 4 or hd.shape[:2] != EXPECTED_HW:
         raise ValueError(f"{path}: {HIGHRES_DYNAMIC_KEY} shape inattesa {hd.shape}")
     if hd.shape[2] < n_bands or hd.shape[3] < n_time:
@@ -265,7 +281,12 @@ def load_highres_static(path: Path) -> Tuple[np.ndarray, int]:
     """
     with np.load(path) as z:
         hs = z[HIGHRES_STATIC_KEY]
+    return highres_static_from_array(hs, path)
 
+
+def highres_static_from_array(hs: np.ndarray, source: Any) -> Tuple[np.ndarray, int]:
+    """The computation of load_highres_static on an array already in memory."""
+    path = source
     if hs.ndim == 2:
         hs = hs[:, :, None]
     if hs.ndim != 3 or hs.shape[:2] != EXPECTED_HW:
@@ -735,27 +756,38 @@ class S2DiffusionCubeDataset(Dataset):
                              size=(self.resize, self.resize),
                              mode="area")
 
+    def _read_arrays(self, path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(highresdynamic, highresstatic, mesodynamic) of a cube, the .npz opened once."""
+        with np.load(path) as z:
+            return z[HIGHRES_DYNAMIC_KEY], z[HIGHRES_STATIC_KEY], z[MESO_DYNAMIC_KEY]
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         path = self.files[idx]
+        hd, hs, md = self._read_arrays(path)
+        return self._build_item(path, hd, hs, md)
 
+    def _build_item(self, path: Path, hd: np.ndarray, hs: np.ndarray,
+                    md: np.ndarray) -> Dict[str, Any]:
+        """The item of a cube whose raw arrays are in memory (see _read_arrays)."""
         # --- highresdynamic: 30 frame nello stesso spazio dell'autoencoder ---
-        imgs, unfixable = load_highres_dynamic(
-            path, n_bands=self.n_channels, n_time=self.T
+        imgs, unfixable = highres_dynamic_from_array(
+            hd, path, n_bands=self.n_channels, n_time=self.T
         )
         imgs = minmax_pm1(imgs, self.highres_lo, self.highres_hi)
 
         # --- highresstatic: invariante nel tempo, gia' allineata ------------
-        static, unfixable_static = load_highres_static(path)
+        static, unfixable_static = highres_static_from_array(hs, path)
         static = minmax_pm1(static, self.static_lo, self.static_hi)
 
         # --- mesodynamic: crop 2x2 centrale + allineamento 1:5 --------------
-        meso = load_meso_dynamic(
-            path,
+        meso = aggregate_meso(
+            md,
             n_channels=self.meso_channels,
             n_time=self.T,
             steps_per_frame=self.steps_per_frame,
             center_crop=self.meso_center_crop,
             agg=self.meso_agg,
+            source=path,
         )
         meso = minmax_pm1(meso, self.meso_lo, self.meso_hi)
         if self.meso_time_span == "future":

@@ -926,6 +926,17 @@ class TestEvalCfg:
     checkpoint: str = "best"                # best | latest | nome di una cartella di checkpoints/
     num_samples: Optional[int] = None       # K predizioni per cubo; null = run.val_num_samples
     subset: int = 0                         # 0 = tutti i cubi; N = N cubi a caso (giro di prova)
+    # extreme e seasonal hanno finestre piu' lunghe di quelle del training (10 + 20 frame).
+    # true = il DiT si ricostruisce con la lunghezza dello split (T = 60 / 210), come sempre;
+    # false = autoregressivo: il modello resta quello del training e la finestra target si copre
+    # a blocchi di 20 frame, ognuno col contesto dei 10 frame piu' recenti (osservati per il
+    # primo blocco, predetti per i successivi). I file hanno "autoreg" nel nome:
+    # metrics_results_<split>_autoreg_K_<K>.{json,csv}, forecasts/<split>_autoreg/.
+    # Non ha effetto su iid e ood, che hanno le finestre del training.
+    long_window: bool = True
+    # cubi per batch dell'inferenza; null = il batch del training, ridotto in proporzione alla
+    # lunghezza della sequenza. A fine split si stampa il picco di VRAM (sopra ~90% rallenta)
+    batch_size: Optional[int] = None
     # per split: N cubi (sempre gli stessi) di cui si salvano le figure per banda, in
     # <run>/results/forecasts/<split>/<cubo>/<banda>.png; 0 = nessuna
     export_cubes: int = 4
@@ -1478,6 +1489,8 @@ def validate_config(cfg: TrainCfg) -> None:
             errors.append("test_eval.num_samples must be >= 1 (or null)")
         if test_eval.subset < 0:
             errors.append("test_eval.subset must be >= 0")
+        if test_eval.batch_size is not None and test_eval.batch_size < 1:
+            errors.append("test_eval.batch_size must be >= 1 (or null)")
         if test_eval.export_cubes < 0:
             errors.append("test_eval.export_cubes must be >= 0")
     if cfg.autoencoder.early_stopping_patience < 0 or cfg.autoencoder.early_stopping_min_delta < 0:

@@ -14,6 +14,9 @@ Metriche di valutazione di un DiT gia' addestrato su uno o piu' split: ENS
     # giro di prova su 50 cubi presi a caso
     python src/scripts/evaluate_ens.py --model [date] --split iid --subset 50
 
+    # extreme e seasonal con le finestre del training, in modo autoregressivo
+    python src/scripts/evaluate_ens.py --model [date] --split extreme seasonal --autoregressive
+
 Argomenti principali
 --------------------
 --model   nome del run addestrato = cartella con il timestamp sotto
@@ -33,8 +36,18 @@ Finestre temporali
     extreme                   20 frame di contesto + 40 target (T = 60)
     seasonal                  70 frame di contesto + 140 target (T = 210)
 Sono le finestre dei file EarthNet2021 (un cubo con un numero di frame diverso ferma la
-valutazione dello split). Con extreme e seasonal il DiT lavora su sequenze piu' lunghe di
-quelle del training (T = 30), e il batch si riduce in proporzione (--batch-size per fissarlo).
+valutazione dello split). Con extreme e seasonal ci sono due modi di lavorare:
+
+    default           il DiT lavora su sequenze piu' lunghe di quelle del training
+                      (T = 30): si ricostruisce con la lunghezza dello split e il batch si
+                      riduce in proporzione (--batch-size per fissarlo)
+    --autoregressive  il DiT resta quello del training (10 frame di contesto + 20 predetti)
+                      e la finestra target si copre a blocchi di 20 frame: il primo blocco
+                      parte dagli ultimi 10 frame osservati, ogni blocco successivo dagli
+                      ultimi 10 frame predetti dal precedente. Il meteo di ogni blocco e'
+                      quello reale dei suoi 30 frame. Con K > 1 si fanno K catene
+                      indipendenti. Vale per gli split con finestre diverse da quelle del
+                      training (extreme, seasonal); per gli altri non cambia nulla.
 
 Cosa calcola
 ------------
@@ -60,6 +73,12 @@ stessa funzione (soglia del 70% di pixel validi per frame, pixel mascherati sost
 dalla predizione, esponente 10.31885115), con data_range esplicito. Il default 2.0 e'
 quello con cui sono calibrati l'esponente e i punteggi pubblicati.
 
+Cubi dei test
+-------------
+Contesto e target di un cubo EarthNet stanno in due file. Non si salva nessuna copia
+fusa: il dataset (src/dataset/test_cubes.py) legge i due file e li unisce in memoria nel
+worker del DataLoader, un cubo alla volta.
+
 Nuvole
 ------
 Come nello scoring ufficiale i pixel nuvolosi sono esclusi dal confronto, ma il
@@ -82,7 +101,18 @@ registry/outputs/diffusion/<run>/results/statistics/
     metrics_results_<split>_K_<K>.csv    una riga per cubo, per gli istogrammi
 Ogni esecuzione riscrive i file del proprio split e K, senza toccare gli altri. Una
 valutazione parziale (--subset N / --max-cubes N) aggiunge il suffisso _subsetN / _firstN
-ai nomi, cosi' un giro di prova non sovrascrive i file dello split intero.
+ai nomi, cosi' un giro di prova non sovrascrive i file dello split intero. Con
+--autoregressive, per gli split che la usano (extreme, seasonal), <split> diventa
+<split>_autoreg ovunque: metrics_results_seasonal_autoreg_K_5.json, forecasts/seasonal_autoreg/,
+e le figure hanno "autoreg" nel titolo.
+
+Velocita'
+---------
+L'inferenza e' il ~90% del tempo. Il campionamento (diffusion_utils.sample_forecast) codifica
+solo il contesto, una volta per cubo, e decodifica solo i frame predetti; lo scoring gira su
+processi separati (--scoring-workers) mentre la GPU lavora sul batch successivo. A fine split
+si stampa il picco di VRAM: sopra ~90% della memoria totale l'inferenza rallenta (usa
+--batch-size piu' piccolo).
 """
 
 from __future__ import annotations
@@ -91,12 +121,16 @@ import argparse
 import csv
 import json
 import logging
+import multiprocessing
+import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 # inference_visualization.py sta nella stessa cartella: lo si importa da li' anche
 # quando lo script e' lanciato da un'altra cartella o da un IDE. Il suo import mette
@@ -111,13 +145,13 @@ from accelerate.utils import set_seed  # noqa: E402
 from torch.utils.data import DataLoader, Dataset  # noqa: E402
 
 from src.config import PathsCfg, project_path, use_project_dir  # noqa: E402
-from src.dataset.dataset_info import load_dataset_info  # noqa: E402
 # lo scoring ENS sta in src/utils/ens_metrics.py, condiviso con il training loop
 # e con evaluate_ae_ens.py
 from src.utils.example_export import pick_cubes, save_cube_forecast  # noqa: E402
 from src.utils.ens_metrics import (  # noqa: E402
     CLOUD_PROB_SCALE, CLOUD_PROB_THRESHOLD, SCORING_MODES, SSIM_DATA_RANGE, SSIM_SCALING,
-    STATISTICS_DIRNAME, MaskedCubeDataset, MaskSources, aggregate, score_batch,
+    STATISTICS_DIRNAME, MaskedCubeDataset, MaskSources, aggregate, init_scoring_worker,
+    score_batch_task,
 )
 
 log = logging.getLogger("evaluate_ens")
@@ -140,65 +174,50 @@ def select_cubes(pool: Sequence[Path], args) -> List[Path]:
     return ordered
 
 
-def merge_pairs(pairs: Sequence[Tuple[Path, Path, Path]], n_context: int, n_target: int,
-                n_bands: int, steps_per_frame: int, workers: int) -> None:
-    """Fonde context+target dei cubi scelti, in parallelo (la fusione e' gia' in cache se valida)."""
-    t0 = time.time()
-    done = 0
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = [pool.submit(viz.merge_pair, ctx, tgt, merged, n_context, n_target,
-                               n_bands, steps_per_frame)
-                   for merged, ctx, tgt in pairs]
-        for fut in futures:
-            fut.result()
-            done += 1
-            if done % 250 == 0 or done == len(futures):
-                rate = (time.time() - t0) / done
-                log.info(f"[merge] {done}/{len(futures)} cubi ({rate:.2f} s/cubo, "
-                         f"~{rate * (len(futures) - done) / 60:.1f} min alla fine)")
+class SplitCubes(NamedTuple):
+    """I cubi scelti di uno split, con quello che serve per leggerli e per le figure."""
+    files: List[Path]
+    sources: MaskSources
+    desc: str
+    # solo per gli split EarthNet: percorso virtuale del cubo -> (file di contesto, file di
+    # target), che il dataset fonde in memoria; None per train e val (un .npz per cubo)
+    pairs: Optional[Dict[str, Tuple[Path, Path]]]
 
 
-def build_split(spec: viz.SplitSpec, cfg, args, n_context: int,
-                n_target: int) -> Tuple[List[Path], MaskSources, str]:
+def build_split(spec: viz.SplitSpec, cfg, args, n_context: int, n_target: int) -> SplitCubes:
     """
-    (cubi scelti, sorgenti della maschera, descrizione) di uno split, con i cubi
-    gia' pronti da leggere: per gli split EarthNet contesto e target sono fusi in
-    un .npz per cubo (solo quelli scelti).
+    I cubi scelti di uno split, la sorgente della maschera nuvole di ognuno e la
+    descrizione. Per gli split EarthNet contesto e target restano nei loro due file
+    originali: non si scrive nessuna copia fusa.
     """
-    params = cfg.data.params
-    if not spec.earthnet:
-        pool, desc, prepare = viz.build_pool(spec, cfg, args, n_context, n_target)
-        selected = prepare(select_cubes(pool, args))
-        return selected, {str(f): (f, n_context) for f in selected}, desc
+    pool, desc, pairs = viz.build_pool(spec, cfg, args)
+    selected = select_cubes(pool, args)
+    if pairs is None:
+        viz.check_cubes_exist(selected)
+        return SplitCubes(selected, {str(f): (f, n_context) for f in selected}, desc, None)
 
-    test_dir = (Path(args.test_root) / f"{spec.name}_test_split" if args.test_root
-                else project_path(cfg.paths.raw_dir).parent / f"{spec.name}_test_split")
-    merged_root = (Path(args.merged_root) if args.merged_root
-                   else project_path(cfg.paths.preprocessed_dir) / "merged_test")
-    pairs = viz.list_pairs(test_dir, merged_root / spec.name)
-    by_merged = {merged: (ctx, tgt) for merged, ctx, tgt in pairs}
-
-    selected = select_cubes(sorted(by_merged), args)
-    merge_pairs([(m, *by_merged[m]) for m in selected], n_context, n_target,
-                int(params.n_channels), int(params.meso_steps_per_frame), args.merge_workers)
+    chosen = {str(f): pairs[str(f)] for f in selected}
     # i frame target stanno interi nel file di target
-    sources = {str(m): (by_merged[m][1], 0) for m in selected}
-    desc = f"test {spec.name} ({test_dir.as_posix()}, {len(pairs)} coppie context/target)"
-    return selected, sources, desc
+    return SplitCubes(selected, {key: (tgt, 0) for key, (_, tgt) in chosen.items()}, desc, chosen)
 
 
-
-def build_loader(cfg, files: List[Path], sources: MaskSources, args, n_context: int,
-                 n_target: int, trained_T: int) -> Tuple[Dataset, DataLoader]:
+def build_loader(cfg, split: SplitCubes, args, n_context: int, n_target: int,
+                 reference_T: int) -> Tuple[Dataset, DataLoader]:
     """
     (dataset, loader) sui cubi scelti: le statistiche di normalizzazione sono quelle
     del training, senza flip, senza shuffle e senza drop_last (nessun cubo deve
     sparire e l'ordine deve essere lo stesso a ogni esecuzione).
+
+    reference_T e' la lunghezza di sequenza per cui e' tarato il batch del config: con
+    sequenze piu' lunghe il batch si riduce in proporzione (con T uguale resta quello del
+    config).
     """
     params = cfg.data.params
-    dataset = viz.build_eval_dataset(cfg, files, n_context, n_target)
-    if args.cloud_mask:
-        dataset = MaskedCubeDataset(dataset, sources, n_target, args.cloud_prob_threshold,
+    cloud = (args.cloud_prob_threshold, args.cloud_prob_scale) if args.cloud_mask else None
+    dataset = viz.build_eval_dataset(cfg, split.files, n_context, n_target,
+                                     pairs=split.pairs, cloud=cloud)
+    if args.cloud_mask and split.pairs is None:
+        dataset = MaskedCubeDataset(dataset, split.sources, n_target, args.cloud_prob_threshold,
                                     args.cloud_prob_scale, params.resize)
 
     if args.batch_size:
@@ -207,56 +226,126 @@ def build_loader(cfg, files: List[Path], sources: MaskSources, args, n_context: 
         # il batch del config e' tarato sulla T del training: con sequenze piu' lunghe
         # (seasonal) la memoria per cubo cresce in proporzione, e il batch cala
         batch_size = max(1, min(int(params.batch_size),
-                                int(params.batch_size) * trained_T // (n_context + n_target)))
+                                int(params.batch_size) * reference_T // (n_context + n_target)))
     num_workers = int(params.num_workers if args.num_workers is None else args.num_workers)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                         num_workers=num_workers, pin_memory=torch.cuda.is_available(),
-                        drop_last=False)
+                        drop_last=False,
+                        prefetch_factor=4 if num_workers > 0 else None)
     return dataset, loader
+
+
+@dataclass(frozen=True)
+class WindowPlan:
+    """
+    Copertura della finestra target a blocchi, con le finestre del training
+    (window_context frame di contesto + window_predict predetti per volta): il blocco k
+    legge i frame [start(k), start(k) + window_context + window_predict) della sequenza
+    dello split.
+    """
+    n_context: int          # frame osservati dello split prima del primo target
+    n_target: int           # frame target dello split
+    window_context: int
+    window_predict: int
+
+    @property
+    def n_windows(self) -> int:
+        return self.n_target // self.window_predict
+
+    @property
+    def window_length(self) -> int:
+        return self.window_context + self.window_predict
+
+    def start(self, k: int) -> int:
+        """Primo frame di contesto del blocco k: gli ultimi osservati, poi avanti di window_predict."""
+        return self.n_context - self.window_context + k * self.window_predict
+
+
+def autoregressive_plan(n_context: int, n_target: int, window_context: int,
+                        window_predict: int) -> WindowPlan:
+    if n_context < window_context:
+        raise SystemExit(f"servono almeno {window_context} frame di contesto, lo split ne ha {n_context}")
+    if n_target % window_predict:
+        raise SystemExit(f"{n_target} frame target non sono multipli dei {window_predict} frame "
+                         f"che il modello predice per volta")
+    return WindowPlan(n_context, n_target, window_context, window_predict)
+
+
+def trained_windows(cfg) -> Tuple[int, int]:
+    """(contesto, predetti) con cui e' stato addestrato il DiT."""
+    n_target = int(cfg.data.params.noise_image_num)
+    return int(cfg.data.params.T) - n_target, n_target
+
+
+def window_item(item: Dict, plan: WindowPlan, k: int = 0) -> Dict:
+    """L'item di un cubo (sequenza intera) ristretto ai frame del blocco k, come li vede il DiT."""
+    start = plan.start(k)
+    stop = start + plan.window_length
+    return {**item, "imgs": item["imgs"][start:stop],
+            "meso_condition_image": item["meso_condition_image"][start:stop]}
 
 
 # ===========================================================================
 # 2. Inferenza: K predizioni in pixel
 # ===========================================================================
 def predict_pixels(batch: Dict, bundle: viz.DitBundle, device: torch.device, n_target: int,
-                   n_samples: int) -> Tuple[List[torch.Tensor], torch.Tensor]:
+                   n_samples: int, plan: Optional[WindowPlan] = None
+                   ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     """
     (K predizioni, target), ognuno (B, n_target, C, H, W) in [-1, 1] su CPU.
 
-    Ogni predizione e' una passata completa di log_videos_local_and_wandb, la
-    funzione di validazione del trainer (encode col VAE, rumore iniziale miscelato al
-    contesto, EulerEDMSampler con CFG, decode): la procedura e' esattamente quella
-    del training. Quella funzione decodifica un solo campione per chiamata, e per
-    avere K campioni in pixel la si chiama K volte (K nuovi rumori iniziali).
+    Ogni predizione ha la procedura di validazione del trainer (encode col VAE del
+    contesto, rumore iniziale miscelato al contesto, EulerEDMSampler con CFG, decode):
+    diffusion_utils.sample_forecast, che codifica il contesto una volta sola per i K
+    campioni (K nuovi rumori iniziali). Con `plan` il batch porta la sequenza intera dello
+    split e la finestra target si copre a blocchi (predict_autoregressive).
     """
     from src.model import diffusion_utils as du
 
     cfg = bundle.cfg
-    preds: List[torch.Tensor] = []
-    target = None
-    for _ in range(n_samples):
-        with torch.no_grad(), viz.autocast_context(device, bundle.mixed_precision):
-            _, _, forecast = du.log_videos_local_and_wandb(
-                batch=batch,
-                model=bundle.model,
-                conditioner=bundle.conditioner,
-                first_stage_model=bundle.first_stage_model,
-                sampler=bundle.sampler,
-                denoiser=bundle.denoiser,
-                input_key=cfg.diffusion.input_key,
-                config_diffusion=cfg.diffusion,
-                noise_image_num=n_target,
-                # argomenti obbligatori della firma, non usati nel corpo
-                metrics_rgbn=None,
-                metrics_ndvi=None,
-                metrics_arvi=None,
-                past_weigth=cfg.diffusion.loss_fn_config.params.past_weight,
-                val_num_samples=1,
-            )
-        # .cpu() su CUDA sincronizza: il tempo misurato fuori e' quello vero
-        preds.append(forecast["pred"].detach().float().cpu())
-        target = forecast["target"].detach().float().cpu()
-    return preds, target
+    imgs = batch[cfg.diffusion.input_key]
+    with torch.no_grad(), viz.autocast_context(device, bundle.mixed_precision):
+        if plan is None:
+            forecasts = du.sample_forecast(
+                batch, imgs[:, :-n_target], bundle.model, bundle.conditioner,
+                bundle.first_stage_model, bundle.sampler, bundle.denoiser, cfg.diffusion,
+                n_target, cfg.diffusion.loss_fn_config.params.past_weight, n_samples)
+            preds = [f.detach().float().cpu() for f in forecasts]
+        else:
+            preds = predict_autoregressive(batch, bundle, plan, n_samples)
+    # .cpu() su CUDA sincronizza: il tempo misurato fuori e' quello vero
+    return preds, imgs[:, -n_target:].detach().float().cpu()
+
+
+def predict_autoregressive(batch: Dict, bundle: viz.DitBundle, plan: WindowPlan,
+                           n_samples: int) -> List[torch.Tensor]:
+    """
+    K catene autoregressive, ognuna (B, n_target, C, H, W) in [-1, 1] su CPU.
+
+    Blocco 0: contesto = gli ultimi window_context frame osservati. Blocco k > 0: contesto
+    = gli ultimi window_context frame predetti dal blocco k - 1 (in pixel, gia' clampati:
+    il VAE li ricodifica). Il meteo del blocco e' quello reale dei suoi frame. Ogni
+    blocco predice window_predict frame; i blocchi si concatenano.
+    """
+    from src.model import diffusion_utils as du
+
+    cfg = bundle.cfg
+    imgs = batch[cfg.diffusion.input_key]
+    meso = batch["meso_condition_image"]
+    first = plan.start(0)
+    contexts = [imgs[:, first:first + plan.window_context] for _ in range(n_samples)]
+    chains: List[List[torch.Tensor]] = [[] for _ in range(n_samples)]
+    for k in range(plan.n_windows):
+        start = plan.start(k)
+        window = {**batch, "meso_condition_image": meso[:, start:start + plan.window_length]}
+        for i in range(n_samples):
+            forecast = du.sample_forecast(
+                window, contexts[i], bundle.model, bundle.conditioner, bundle.first_stage_model,
+                bundle.sampler, bundle.denoiser, cfg.diffusion, plan.window_predict,
+                cfg.diffusion.loss_fn_config.params.past_weight, 1)[0]
+            chains[i].append(forecast.detach().float().cpu())
+            contexts[i] = forecast[:, -plan.window_context:]
+    return [torch.cat(chain, dim=1) for chain in chains]
 
 
 # ===========================================================================
@@ -280,6 +369,7 @@ def save_results(out_dir: Path, split: str, n_samples: int,
     """
     metrics_results_<split>_K_<K>[<suffix>].json (aggregati + metadati + per cubo) e
     .csv (una riga per cubo) in <run>/results/statistics/. Riscritti a ogni esecuzione.
+    `split` e' il nome dello split, con "_autoreg" se la finestra target e' coperta a blocchi.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = f"metrics_results_{split}_K_{n_samples}{suffix}"
@@ -312,6 +402,9 @@ def print_report(payload: Dict[str, object]) -> None:
     print(f"  checkpoint {run['checkpoint']} (step {run['step']})")
     print(f"  {run['n_cubes']} cubi, {run['n_context']} frame di contesto + "
           f"{run['n_target']} predetti, K={run['n_samples']}")
+    if run.get("autoregressive"):
+        print(f"  autoregressivo: {run['n_windows']} blocchi da "
+              f"{run['window'][0]}+{run['window'][1]} frame")
     print("=" * 62)
     print()
     print(f"  ENS   EarthNetScore            {_fmt(agg['ENS'])}")
@@ -330,8 +423,14 @@ def print_report(payload: Dict[str, object]) -> None:
         print(f"  cubi esclusi (tutti nuvolosi)  {run['n_cubes_skipped']}")
     print(f"  tempo: {timing['total_s']:.0f} s  "
           f"({timing['inference_s']:.0f} s inferenza + "
-          f"{timing['scoring_s']:.0f} s scoring [{timing['scoring']}] + "
+          f"{timing['scoring_wait_s']:.0f} s attesa scoring + "
           f"{timing['data_s']:.0f} s dati) = {timing['s_per_cube']:.2f} s/cubo")
+    print(f"  scoring [{timing['scoring']}]: {timing['scoring_s']:.0f} s di CPU su "
+          f"{timing['scoring_workers']} processi")
+    memory = payload.get("memory")
+    if memory:
+        print(f"  VRAM: picco {memory['peak_reserved_gb']:.1f} GB su {memory['total_gb']:.1f} GB "
+              f"({memory['peak_reserved_fraction']:.0%}), batch {run['batch_size']}")
     print()
 
 
@@ -368,25 +467,48 @@ def checkpoint_step(ckpt: Path) -> Optional[int]:
 
 def prepare_bundle(spec: viz.SplitSpec, args, cfg, ckpt: Path, device: torch.device,
                    state: Dict):
-    """(contesto, target, config con le finestre dello split, modello): lo (ri)carica se serve."""
+    """
+    (contesto, target, config, modello, piano autoregressivo): lo (ri)carica se serve.
+
+    Di default, se le finestre dello split non sono quelle del training, il DiT si ricostruisce
+    con la lunghezza dello split (config con le finestre dello split). Con --autoregressive e
+    finestre diverse dal training il modello resta quello del training: il piano (WindowPlan)
+    copre la finestra target a blocchi.
+    """
     n_context, n_target = viz.split_windows(spec, cfg)
-    split_cfg = viz.with_windows(cfg, n_context, n_target)
-    if split_cfg is not cfg:
-        log.warning(
-            f"[{spec.name}] finestre {n_context}+{n_target} (T={n_context + n_target}) diverse da "
-            f"quelle del training (T={cfg.data.params.T}, {cfg.data.params.noise_image_num} "
-            f"target): i pesi appresi sono gli stessi, ma e' un'estrapolazione in lunghezza e "
-            f"le predizioni potrebbero degradare.")
+    plan: Optional[WindowPlan] = None
+    if args.autoregressive and (n_context, n_target) != trained_windows(cfg):
+        plan = autoregressive_plan(n_context, n_target, *trained_windows(cfg))
+        split_cfg = cfg
+        windows = trained_windows(cfg)
+        log.info(f"[{spec.name}] autoregressivo: {plan.n_windows} blocchi da "
+                 f"{plan.window_context}+{plan.window_predict} frame sulla sequenza "
+                 f"{n_context}+{n_target}")
+    else:
+        split_cfg = viz.with_windows(cfg, n_context, n_target)
+        windows = (n_context, n_target)
+        if split_cfg is not cfg:
+            log.warning(
+                f"[{spec.name}] finestre {n_context}+{n_target} (T={n_context + n_target}) diverse da "
+                f"quelle del training (T={cfg.data.params.T}, {cfg.data.params.noise_image_num} "
+                f"target): i pesi appresi sono gli stessi, ma e' un'estrapolazione in lunghezza e "
+                f"le predizioni potrebbero degradare (--autoregressive per usare le finestre "
+                f"del training).")
 
     # il DiT dipende dalla lunghezza della sequenza: lo si (ri)costruisce quando le
-    # finestre dello split cambiano
-    if state.get("bundle") is None or state["windows"] != (n_context, n_target):
+    # finestre del modello cambiano
+    if state.get("bundle") is None or state["windows"] != windows:
         state["bundle"] = None
         if device.type == "cuda":
             torch.cuda.empty_cache()
         state["bundle"] = viz.load_dit(split_cfg, ckpt, device)
-        state["windows"] = (n_context, n_target)
-    return n_context, n_target, split_cfg, state["bundle"]
+        state["windows"] = windows
+    return n_context, n_target, split_cfg, state["bundle"], plan
+
+
+def split_tag(spec: viz.SplitSpec, plan: Optional[WindowPlan]) -> str:
+    """Nome dello split nei file e nei report: '<split>_autoreg' se la finestra e' coperta a blocchi."""
+    return f"{spec.name}_autoreg" if plan is not None else spec.name
 
 
 def export_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
@@ -396,107 +518,206 @@ def export_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
     cubi del training e di una valutazione normale), con una predizione per cubo. Niente
     scoring, niente file in statistics/.
     """
-    n_context, n_target, split_cfg, bundle = prepare_bundle(spec, args, cfg, ckpt, device, state)
-    files, sources, _ = build_split(spec, split_cfg, args, n_context, n_target)
-    chosen = [Path(f) for f in pick_cubes(files, args.export_cubes, int(cfg.run.seed))]
-    _, loader = build_loader(split_cfg, chosen, sources, args, n_context, n_target,
-                             int(cfg.data.params.T))
-    export_dir = run_dir / "results" / "forecasts" / spec.name
+    n_context, n_target, split_cfg, bundle, plan = prepare_bundle(spec, args, cfg, ckpt, device,
+                                                                   state)
+    tag = split_tag(spec, plan)
+    split = build_split(spec, split_cfg, args, n_context, n_target)
+    chosen = [Path(f) for f in pick_cubes(split.files, args.export_cubes, int(cfg.run.seed))]
+    chosen_split = SplitCubes(chosen, {str(f): split.sources[str(f)] for f in chosen}, split.desc,
+                              None if split.pairs is None else
+                              {str(f): split.pairs[str(f)] for f in chosen})
+    _, loader = build_loader(split_cfg, chosen_split, args, n_context, n_target,
+                             n_context + n_target if plan else int(cfg.data.params.T))
+    export_dir = run_dir / "results" / "forecasts" / tag
     cloud_cfg = SimpleNamespace(cloud_prob_threshold=args.cloud_prob_threshold,
                                 cloud_prob_scale=args.cloud_prob_scale)
-    log.info(f"[{spec.name}] per-band figures of {len(chosen)} cubes in {export_dir}")
+    log.info(f"[{tag}] per-band figures of {len(chosen)} cubes in {export_dir}")
 
     set_seed(args.seed)
     for batch in loader:
         cube_paths = batch["cube_path"]
         batch.pop("cloud_mask", None)
         batch = viz.move_batch(batch, device, bundle.weight_dtype)
-        preds, target = predict_pixels(batch, bundle, device, n_target, 1)
+        preds, target = predict_pixels(batch, bundle, device, n_target, 1, plan)
         for b, path in enumerate(cube_paths):
-            save_cube_forecast([export_dir], path, target[b], preds[0][b], sources[str(path)],
+            save_cube_forecast([export_dir], path, target[b], preds[0][b], split.sources[str(path)],
                                cloud_cfg, split_cfg.data.params.resize,
                                masked=bool(args.cloud_mask),
-                               title=f"{spec.name} | {ckpt.name}")
-    return {"split": spec.name, "n_cubes": len(chosen), "dir": export_dir.as_posix()}
+                               title=f"{tag} | {ckpt.name}")
+    return {"split": tag, "n_cubes": len(chosen), "dir": export_dir.as_posix()}
+
+
+class SerialExecutor:
+    """Stessa interfaccia di ProcessPoolExecutor, esegue subito nel processo (--scoring-workers 0)."""
+
+    def submit(self, fn, *fn_args) -> Future:
+        future: Future = Future()
+        try:
+            future.set_result(fn(*fn_args))
+        except BaseException as error:  # noqa: BLE001 - lo rilancia result()
+            future.set_exception(error)
+        return future
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def make_scoring_pool(workers: int):
+    """
+    Il pool su cui gira lo scoring mentre la GPU lavora sul batch dopo. Processi in 'spawn'
+    (come i worker del DataLoader su Windows, e mai un fork di un processo con CUDA): ognuno
+    importa ens_metrics e basta.
+    """
+    if workers <= 0:
+        return SerialExecutor()
+    return ProcessPoolExecutor(max_workers=workers,
+                               mp_context=multiprocessing.get_context("spawn"),
+                               initializer=init_scoring_worker)
+
+
+def vram_report(device: torch.device) -> Optional[Dict[str, float]]:
+    """Picco di memoria GPU dal reset (GB) e frazione della memoria totale; None senza CUDA."""
+    if device.type != "cuda":
+        return None
+    total = torch.cuda.get_device_properties(device).total_memory
+    allocated = torch.cuda.max_memory_allocated(device)
+    reserved = torch.cuda.max_memory_reserved(device)
+    return {"total_gb": round(total / 2 ** 30, 2),
+            "peak_allocated_gb": round(allocated / 2 ** 30, 2),
+            "peak_reserved_gb": round(reserved / 2 ** 30, 2),
+            "peak_reserved_fraction": round(reserved / total, 3)}
+
+
+# sopra questa frazione della memoria della GPU il driver comincia a spostare dati nella
+# memoria condivisa (Windows) o l'allocatore a liberare e riallocare: l'inferenza rallenta
+VRAM_WARNING_FRACTION = 0.90
 
 
 def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
                    device: torch.device, state: Dict) -> Dict[str, object]:
     """Carica il modello (se servono altre finestre), gira sullo split, aggrega e salva."""
-    n_context, n_target, split_cfg, bundle = prepare_bundle(spec, args, cfg, ckpt, device, state)
+    n_context, n_target, split_cfg, bundle, plan = prepare_bundle(spec, args, cfg, ckpt, device,
+                                                                   state)
+    tag = split_tag(spec, plan)
 
     t_data = time.time()
-    files, sources, desc = build_split(spec, split_cfg, args, n_context, n_target)
-    dataset, loader = build_loader(split_cfg, files, sources, args, n_context, n_target,
-                                   int(cfg.data.params.T))
+    split = build_split(spec, split_cfg, args, n_context, n_target)
+    # il batch del config e' tarato sulle finestre del training: nel modo autoregressivo il
+    # modello vede sempre quelle, quindi il batch non si riduce
+    dataset, loader = build_loader(split_cfg, split, args, n_context, n_target,
+                                   n_context + n_target if plan else int(cfg.data.params.T))
+    files, sources, desc = split.files, split.sources, split.desc
     n_cubes = len(files)
-    log.info(f"[{spec.name}] {desc}: {n_cubes} cubi valutati, sequenza "
+    log.info(f"[{tag}] {desc}: {n_cubes} cubi valutati, sequenza "
              f"{n_context + n_target} = {n_context} contesto + {n_target} target, "
              f"batch {loader.batch_size}, maschera nuvole {'ON' if args.cloud_mask else 'OFF'}")
 
     from src.model import diffusion_utils as du
     first = dataset[0]
-    du.check_data_model_alignment(first, split_cfg.diffusion, bundle.first_stage_info)
+    du.check_data_model_alignment(window_item(first, plan) if plan else first,
+                                  split_cfg.diffusion, bundle.first_stage_info)
     t_data = time.time() - t_data
 
     p = split_cfg.data.params
     lo, hi = (a.reshape(-1).astype(np.float32)
               for a in viz.load_highres_stats(p.stats_json, p.stats_time_key, p.n_channels))
 
-    # Il sampling parte da un randn e OLS aggiunge un rumore di regolarizzazione con il
-    # generatore legacy di numpy: senza i due seed, due esecuzioni sullo stesso
-    # checkpoint darebbero numeri leggermente diversi.
+    # Il sampling parte da un randn; il rumore di regolarizzazione di OLS riparte per ogni
+    # cubo da un seed che dipende dal cubo (score_batch): senza i seed, due esecuzioni sullo
+    # stesso checkpoint darebbero numeri leggermente diversi.
     set_seed(args.seed)
     np.random.seed(args.seed)
 
     # --export-cubes: the same cubes every time (fixed seed, sorted files), also the ones the
     # training exported for val
     export_cubes = set(pick_cubes(files, args.export_cubes, int(cfg.run.seed)))
-    export_dir = run_dir / "results" / "forecasts" / spec.name
+    export_dir = run_dir / "results" / "forecasts" / tag
     cloud_cfg = SimpleNamespace(cloud_prob_threshold=args.cloud_prob_threshold,
                                 cloud_prob_scale=args.cloud_prob_scale)
     if export_cubes:
-        log.info(f"[{spec.name}] per-band figures of {len(export_cubes)} cubes in {export_dir}")
+        log.info(f"[{tag}] per-band figures of {len(export_cubes)} cubes in {export_dir}")
 
     rows: List[Dict[str, object]] = []
     t0 = time.time()
-    t_infer = t_score = 0.0
+    t_infer = t_wait = t_score_cpu = 0.0
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
-    for batch in loader:
-        t_batch = time.time()
-        cube_paths = batch["cube_path"]
-        cloud = batch.pop("cloud_mask", None)
-        batch = viz.move_batch(batch, device, bundle.weight_dtype)
-        preds, target = predict_pixels(batch, bundle, device, n_target, args.num_samples)
-        if target.shape[1] != n_target or preds[0].shape != target.shape:
-            raise SystemExit(f"[{spec.name}] attesi {n_target} frame target, ottenuti "
-                             f"{target.shape[1]} (predetti {tuple(preds[0].shape)})")
-        t_infer += time.time() - t_batch
+    # Lo scoring (CPU) gira su processi separati mentre la GPU predice il batch dopo: il
+    # processo principale aspetta solo quando troppi batch sono in coda (la memoria dei
+    # tensori in attesa resta limitata) e alla fine.
+    workers = min(max(0, int(args.scoring_workers)), max(1, (os.cpu_count() or 2) - 1))
+    max_pending = 2 * max(workers, 1)
+    pending: Deque[Future] = deque()
 
-        t_batch = time.time()
-        batch_rows = score_batch(preds, target, cloud, cube_paths, lo, hi,
-                                 args.ssim_data_range, args.scoring)
+    def finish_oldest() -> None:
+        nonlocal t_wait, t_score_cpu
+        start = time.time()
+        batch_rows, cpu_seconds = pending.popleft().result()
+        t_wait += time.time() - start
+        t_score_cpu += cpu_seconds
         rows.extend(batch_rows)
-        t_score += time.time() - t_batch
 
-        # per-band figures of the chosen cubes, with the best of the K predictions (the one
-        # the ENS kept). Not counted in the scoring time.
-        for b, path in enumerate(cube_paths):
-            if str(path) in export_cubes:
-                save_cube_forecast([export_dir], path, target[b],
-                                   preds[batch_rows[b].get("sample") or 0][b],
-                                   sources[str(path)], cloud_cfg, p.resize,
-                                   masked=bool(args.cloud_mask),
-                                   title=f"{spec.name} | {ckpt.name} (best of K={args.num_samples})")
+    n_predicted = 0
+    with make_scoring_pool(workers) as pool:
+        for i_batch, batch in enumerate(loader, 1):
+            t_batch = time.time()
+            cube_paths = batch["cube_path"]
+            cloud = batch.pop("cloud_mask", None)
+            batch = viz.move_batch(batch, device, bundle.weight_dtype)
+            preds, target = predict_pixels(batch, bundle, device, n_target, args.num_samples, plan)
+            if target.shape[1] != n_target or preds[0].shape != target.shape:
+                raise SystemExit(f"[{tag}] attesi {n_target} frame target, ottenuti "
+                                 f"{target.shape[1]} (predetti {tuple(preds[0].shape)})")
+            t_infer += time.time() - t_batch
+            n_predicted += len(cube_paths)
 
-        done = len(rows)
-        if done % max(loader.batch_size * 5, 1) == 0 or done == n_cubes:
-            rate = (time.time() - t0) / max(done, 1)
-            log.info(f"[{spec.name}] {done}/{n_cubes} cubi ({rate:.1f} s/cubo, "
-                     f"~{rate * (n_cubes - done) / 60:.1f} min alla fine)")
+            t_batch = time.time()
+            future = pool.submit(score_batch_task, preds, target, cloud, [str(c) for c in cube_paths],
+                                 lo, hi, args.ssim_data_range, args.scoring, args.seed)
+            pending.append(future)
+            t_wait += time.time() - t_batch
+
+            # per-band figures of the chosen cubes, with the best of the K predictions (the one
+            # the ENS kept): it needs the scores of this batch. Not counted in the scoring time.
+            chosen = [b for b, path in enumerate(cube_paths) if str(path) in export_cubes]
+            if chosen:
+                batch_rows = future.result()[0]
+                for b in chosen:
+                    save_cube_forecast([export_dir], cube_paths[b], target[b],
+                                       preds[batch_rows[b].get("sample") or 0][b],
+                                       sources[str(cube_paths[b])], cloud_cfg, p.resize,
+                                       masked=bool(args.cloud_mask),
+                                       title=f"{tag} | {ckpt.name} (best of K={args.num_samples})")
+
+            while len(pending) > max_pending:
+                finish_oldest()
+
+            if i_batch % 5 == 0 or n_predicted == n_cubes:
+                rate = (time.time() - t0) / max(n_predicted, 1)
+                log.info(f"[{tag}] {n_predicted}/{n_cubes} cubi ({rate:.1f} s/cubo, "
+                         f"~{rate * (n_cubes - n_predicted) / 60:.1f} min alla fine)")
+        while pending:
+            finish_oldest()
 
     if not rows:
-        raise SystemExit(f"[{spec.name}] nessun cubo valutato.")
+        raise SystemExit(f"[{tag}] nessun cubo valutato.")
+
+    vram = vram_report(device)
+    if vram is not None:
+        log.info(f"[{tag}] VRAM: picco {vram['peak_allocated_gb']:.1f} GB usati, "
+                 f"{vram['peak_reserved_gb']:.1f} GB riservati su {vram['total_gb']:.1f} GB "
+                 f"({vram['peak_reserved_fraction']:.0%}), batch {loader.batch_size}")
+        if vram["peak_reserved_fraction"] > VRAM_WARNING_FRACTION:
+            log.warning(f"[{tag}] la VRAM e' al {vram['peak_reserved_fraction']:.0%} "
+                        f"(batch {loader.batch_size}): sopra ~{VRAM_WARNING_FRACTION:.0%} "
+                        f"l'inferenza tende a rallentare. Prova un --batch-size piu' piccolo.")
 
     elapsed = time.time() - t0
     payload = {
@@ -506,7 +727,11 @@ def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
             "checkpoint": ckpt.name,
             "checkpoint_path": ckpt.as_posix(),
             "step": checkpoint_step(ckpt),
-            "split": spec.name,
+            "split": tag,
+            "base_split": spec.name,
+            "autoregressive": plan is not None,
+            "window": ([plan.window_context, plan.window_predict] if plan else None),
+            "n_windows": (plan.n_windows if plan else None),
             "sample_pool": desc,
             "selection": ("subset" if args.subset else "max_cubes" if args.max_cubes else "all"),
             "n_context": n_context,
@@ -516,6 +741,7 @@ def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
             "n_cubes": len(rows),
             "n_cubes_skipped": sum(1 for r in rows if r["ENS"] is None),
             "n_samples": int(args.num_samples),
+            "batch_size": loader.batch_size,
             "seed": args.seed,
             "device": str(device),
             "stats_json": str(p.stats_json),
@@ -524,12 +750,17 @@ def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
         "timing": {
             "total_s": round(elapsed, 1),
             "inference_s": round(t_infer, 1),
-            "scoring_s": round(t_score, 1),
+            # secondi di CPU dello scoring (somma sui processi) e secondi in cui il processo
+            # principale ha dovuto aspettarlo: la differenza e' lo scoring nascosto dietro la GPU
+            "scoring_s": round(t_score_cpu, 1),
+            "scoring_wait_s": round(t_wait, 1),
+            "scoring_workers": workers,
             # Quel che avanza e' l'attesa dei worker del DataLoader (disco).
-            "data_s": round(max(elapsed - t_infer - t_score, 0.0) + t_data, 1),
+            "data_s": round(max(elapsed - t_infer - t_wait, 0.0) + t_data, 1),
             "s_per_cube": round(elapsed / max(len(rows), 1), 3),
             "scoring": args.scoring,
         },
+        "memory": vram,
         "scoring": {
             "space": "riflettanza [0, 1], clip come CubeCalculator.load_file",
             "mode": args.scoring,
@@ -550,7 +781,7 @@ def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path,
     }
 
     json_path, csv_path = save_results(run_dir / "results" / STATISTICS_DIRNAME,
-                                       spec.name, int(args.num_samples), payload,
+                                       tag, int(args.num_samples), payload,
                                        selection_suffix(args))
     print_report(payload)
     log.info(f"[out] {json_path}")
@@ -590,11 +821,19 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                         "per una prova, non per un numero da riportare")
     p.add_argument("--batch-size", type=int, default=None,
                    help="cubi per batch (default: il batch_size del config del run, "
-                        "ridotto in proporzione alla lunghezza della sequenza se piu' lunga)")
+                        "ridotto in proporzione alla lunghezza della sequenza se piu' lunga). "
+                        "A fine split si stampa il picco di VRAM: oltre ~90% rallenta")
     p.add_argument("--num-workers", type=int, default=None,
                    help="worker del DataLoader (default: data.params.num_workers del config)")
-    p.add_argument("--merge-workers", type=int, default=8,
-                   help="thread per la fusione context+target degli split EarthNet")
+    p.add_argument("--scoring-workers", type=int, default=4,
+                   help="processi che calcolano le metriche mentre la GPU predice il batch "
+                        "dopo (0 = nello stesso processo, in serie)")
+    p.add_argument("--autoregressive", action="store_true",
+                   help="extreme e seasonal con le finestre del training (10 frame di contesto "
+                        "+ 20 predetti), coprendo la finestra target a blocchi: ogni blocco "
+                        "parte dagli ultimi 10 frame predetti dal precedente. I file hanno "
+                        "'autoreg' nel nome. Senza, il DiT si ricostruisce con la lunghezza "
+                        "dello split")
     p.add_argument("--scoring", choices=SCORING_MODES, default="fast",
                    help="implementazione di MAD ed EMD: 'fast' (vettorizzate qui) o "
                         "'toolkit' (originali di earthnet). Stesso numero; la seconda "
@@ -625,9 +864,6 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     p.add_argument("--test-root", type=str, default=None,
                    help="cartella che contiene <split>_test_split/{context,target} "
                         "(default: la cartella che contiene paths.raw_dir, cioe' data/raw)")
-    p.add_argument("--merged-root", type=str, default=None,
-                   help="dove si salvano i cubi test fusi context+target "
-                        "(default: <preprocessed_dir>/merged_test)")
     p.add_argument("--log-level", default="INFO")
     return p.parse_args(argv)
 
@@ -654,6 +890,10 @@ def evaluate_run(args, raise_on_failure: bool = True) -> List[Dict[str, object]]
         raise SystemExit("--subset e --max-cubes sono alternativi")
     if args.export_only and args.export_cubes < 1:
         raise SystemExit("--export-only richiede --export-cubes >= 1")
+    if args.scoring_workers < 0:
+        raise SystemExit("--scoring-workers deve essere >= 0")
+    if args.batch_size is not None and args.batch_size < 1:
+        raise SystemExit("--batch-size deve essere >= 1")
 
     run_dir = viz.resolve_run(args.model, family_dir)
     cfg = viz.load_run_config(run_dir)
@@ -677,6 +917,8 @@ def evaluate_run(args, raise_on_failure: bool = True) -> List[Dict[str, object]]
     print(f"device      : {device}")
     print(f"split       : {', '.join(s.name for s in args.split)} | K={args.num_samples} | "
           f"seed {args.seed}")
+    if args.autoregressive:
+        print("modo        : autoregressivo (finestre del training) su extreme e seasonal")
     print(f"output      : {(run_dir / 'results' / STATISTICS_DIRNAME).as_posix()}")
     print("=" * 78)
 

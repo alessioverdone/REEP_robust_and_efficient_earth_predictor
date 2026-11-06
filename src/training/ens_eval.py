@@ -114,6 +114,10 @@ def evaluate_test_splits(cfg, rt, outputs, state):
             "--device", str(rt.accelerator.device)]
     if test_eval.subset:
         argv += ["--subset", str(test_eval.subset)]
+    if test_eval.batch_size:
+        argv += ["--batch-size", str(test_eval.batch_size)]
+    if not test_eval.long_window:
+        argv += ["--autoregressive"]
     if test_eval.export_cubes:
         argv += ["--export-cubes", str(test_eval.export_cubes)]
 
@@ -132,7 +136,7 @@ def evaluate_test_splits(cfg, rt, outputs, state):
         return None
 
     for payload in payloads:
-        split = payload["run"]["split"]
+        split = payload["run"]["split"]         # "<split>_autoreg" for the autoregressive ones
         rt.tracker.summary({f"test/{split}/{key}": value
                             for key, value in payload["aggregate"].items()
                             if isinstance(value, (int, float))})

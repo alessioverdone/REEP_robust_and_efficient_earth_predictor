@@ -298,18 +298,27 @@ accelerate launch src/scripts/run_diffusion_train.py --project_name diffusion_v1
 | `diffusion.loss_pixels` | `all` (default) or `valid`: with `valid` the diffusion loss (training and validation) leaves out the cloudy pixels of the target frames, with the same rule as the ENS (`ens.cloud_prob_threshold` / `ens.cloud_prob_scale`, read from the original `.npz`; `ens.enabled` is not needed). The pixel mask is area-averaged to the latent resolution: each latent cell weighs the fraction of its pixels that are valid |
 | `diffusion.save_best_by` | the validation epoch kept as `checkpoints/best`: `rmse` (default, lowest `latter_rmse`), `loss` (lowest validation loss, computed with the same sigmas and noises at every validation and without condition dropout, so that epochs are compared on the same draws) or `ens` (highest validation ENS, needs `ens.enabled` and `ens.validation`). `best_metric.json` records the criterion, and a resumed run inherits the best only if it used the same one |
 | `ens` | EarthNet metrics during the training: ENS (harmonic mean of MAD, OLS, EMD, SSIM) plus SSIM_RAW, P-MAE, N-MAE, on the validation set at every validation and, with `ens.train`, on a sample of training cubes. Every cube is predicted `run.val_num_samples` times and the best prediction is kept. `val_*` / `train_*` columns in `history.csv`, plots in `results/curves/ens*.png`. Needs `earthnet` and `scikit-image` |
-| `test_eval` | at the end of the training, `src/scripts/evaluate_ens.py` runs on `test_eval.splits` (iid, ood, extreme, seasonal) with the `best` checkpoint; results in `<run>/results/statistics/`, a failure does not fail the run. **It is on by default and scores every cube of the splits (about 16k): for a debug run use `--set test_eval.enabled=false` or `test_eval.subset=N`** |
+| `test_eval` | at the end of the training, `src/scripts/evaluate_ens.py` runs on `test_eval.splits` (iid, ood, extreme, seasonal) with the `best` checkpoint; results in `<run>/results/statistics/` (`long_window`: false evaluates extreme/seasonal autoregressively, `batch_size`: cubes per batch), a failure does not fail the run. **It is on by default and scores every cube of the splits (about 16k): for a debug run use `--set test_eval.enabled=false` or `test_eval.subset=N`** |
 
 The test splits are read from `data/raw/<split>_test_split/{context,target}` and keep
 the windows of the EarthNet2021 files: iid and ood 10 + 20 frames, extreme 20 + 40,
-seasonal 70 + 140 (the DiT then works on sequences longer than the 30 frames it was
-trained on, see `with_windows` in `inference_visualization.py`).
+seasonal 70 + 140. For extreme and seasonal there are two ways to work (`test_eval.long_window`,
+`--autoregressive` by hand): `long_window: true` (default) rebuilds the DiT at the length of the
+split, so it works on sequences longer than the 30 frames it was trained on (see `with_windows`
+in `inference_visualization.py`); `long_window: false` keeps the trained DiT (10 context + 20
+predicted frames) and covers the target window in blocks of 20 frames, each one starting from the
+last 10 frames available (the observed ones for the first block, the predicted ones of the previous
+block for the others; the weather is the real one of each block). The files of the autoregressive
+mode are named `metrics_results_<split>_autoreg_K_<K>.{json,csv}` and `forecasts/<split>_autoreg/`.
+The cubes of the test splits are not copied anywhere: context and target files are read and joined
+in memory by the dataset (`src/dataset/test_cubes.py`).
 
 The same evaluations can be run by hand on any finished run (`--model` is the run folder,
 a piece of its name, or `latest`):
 
 ```bash
 python src/scripts/evaluate_ens.py    --model latest --split val iid ood extreme seasonal --num-samples 5
+python src/scripts/evaluate_ens.py    --model latest --split extreme seasonal --autoregressive   # *_autoreg files
 python src/scripts/evaluate_ae_ens.py --model latest --split train val iid          # autoencoder only
 python src/scripts/inference_visualization.py --type dit --model latest --split val iid --num-samples 3
 ```
@@ -318,6 +327,10 @@ python src/scripts/inference_visualization.py --type dit --model latest --split 
 (a partial evaluation, `--subset N` or `--max-cubes N`, gets a `_subsetN` / `_firstN` suffix
 so that it does not overwrite the one of the whole split); `inference_visualization.py`
 writes the figures into `<run>/results/predictions/`.
+
+`evaluate_ens.py` scores on separate processes (`--scoring-workers`) while the GPU predicts the next
+batch, and logs the peak VRAM at the end of each split: above ~90% of the memory the inference
+slows down, use a smaller `--batch-size` (`test_eval.batch_size` in the config).
 
 ---
 

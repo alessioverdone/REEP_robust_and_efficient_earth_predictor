@@ -487,7 +487,9 @@ class DiT(nn.Module):
         # print(f't_patchify:{t}')
 
         for block in self.blocks:
-            if self.use_checkpoint:
+            # activation checkpointing only trades compute for memory when there is a
+            # backward pass: in eval (validation, test) it is just overhead
+            if self.use_checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), x, c, static_var)       # (N, T, D)
             else:
                 x = block(x, c, static_var)       # (N, T, D)

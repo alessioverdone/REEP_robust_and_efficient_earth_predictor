@@ -263,6 +263,8 @@ test_eval:
   num_samples: 1           # K predictions per cube (best kept); null = run.val_num_samples
   subset: 3                   # 0 = every cube | N = N random cubes (quick test)
   export_cubes: 2             # cubes per split with per-band figures in results/forecasts/<split>/, 0 = none
+  long_window: true           # extreme/seasonal: true = DiT rebuilt at the split length (T=60/210); false = autoregressive, 10 context + 20 predicted frames at a time (files named *_autoreg*). iid/ood: no effect
+  batch_size: null            # cubes per batch at inference; null = training batch (scaled down for long sequences). The peak VRAM is logged: above ~90% it slows down
   seed: 42
 
 # Live report on Weights & Biases (both phases): metrics, artifacts/ and

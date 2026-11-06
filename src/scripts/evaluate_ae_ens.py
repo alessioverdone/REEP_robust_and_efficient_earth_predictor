@@ -219,10 +219,11 @@ def evaluate_split(spec: viz.SplitSpec, args, cfg, run_dir: Path, ckpt: Path, ae
     n_context, n_target = viz.split_windows(spec, cfg)
 
     t_data = time.time()
-    files, sources, desc = ens.build_split(spec, cfg, args, n_context, n_target)
-    dataset, loader = ens.build_loader(cfg, files, sources, args, n_context, n_target,
+    split = ens.build_split(spec, cfg, args, n_context, n_target)
+    dataset, loader = ens.build_loader(cfg, split, args, n_context, n_target,
                                        int(cfg.data.params.T))
-    n_cubes = len(files)
+    desc = split.desc
+    n_cubes = len(split.files)
     log.info(f"[{spec.name}] {desc}: {n_cubes} cubi valutati, {n_target} frame target "
              f"(sequenza {n_context + n_target} = {n_context} contesto + {n_target} target), "
              f"batch {loader.batch_size}, maschera nuvole {'ON' if args.cloud_mask else 'OFF'}")
@@ -387,8 +388,6 @@ def parse_args():
                         "ridotto in proporzione alla lunghezza della sequenza se piu' lunga)")
     p.add_argument("--num-workers", type=int, default=None,
                    help="worker del DataLoader (default: data.params.num_workers del config)")
-    p.add_argument("--merge-workers", type=int, default=8,
-                   help="thread per la fusione context+target degli split EarthNet")
     p.add_argument("--scoring", choices=em.SCORING_MODES, default="fast",
                    help="implementazione di MAD ed EMD: 'fast' (vettorizzate) o 'toolkit' "
                         "(originali di earthnet). Stesso numero")
@@ -410,9 +409,6 @@ def parse_args():
     p.add_argument("--test-root", type=str, default=None,
                    help="cartella che contiene <split>_test_split/{context,target} "
                         "(default: la cartella che contiene paths.raw_dir, cioe' data/raw)")
-    p.add_argument("--merged-root", type=str, default=None,
-                   help="dove si salvano i cubi test fusi context+target "
-                        "(default: <preprocessed_dir>/merged_test)")
     p.add_argument("--log-level", default="INFO")
     return p.parse_args()
 

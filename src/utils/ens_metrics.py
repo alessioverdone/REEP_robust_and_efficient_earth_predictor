@@ -18,6 +18,8 @@ aggregate(), che media i sottopunteggi sui cubi e poi fa la media armonica.
 
 from __future__ import annotations
 
+import time
+import zlib
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -117,6 +119,21 @@ def load_cloud_frames(path, frames: Sequence[int], threshold: float, prob_scale:
     return prob[:, 0].numpy(), valid[:, 0].numpy() > 0.5
 
 
+def cloud_mask_tensor(hd: np.ndarray, threshold: float, prob_scale: float,
+                      resize: Optional[int]) -> torch.Tensor:
+    """
+    highresdynamic (H, W, C, n) of the target frames of a cube -> "cloud_mask"
+    (n, 1, H, W) float32, 1 = valid pixel, at the resolution of the images: with resize
+    below the native one it is the area interpolation of the images, and a pixel is valid
+    only if all its sub-pixels are.
+    """
+    mask = torch.from_numpy(valid_mask(hd, threshold, prob_scale)
+                            .astype(np.float32)).unsqueeze(1)                  # (n, 1, H, W)
+    if resize is not None and tuple(mask.shape[-2:]) != (resize, resize):
+        mask = (F.interpolate(mask, size=(resize, resize), mode="area") >= 0.999).float()
+    return mask
+
+
 class MaskedCubeDataset(Dataset):
     """
     Il dataset di valutazione piu' la maschera nuvole dei frame target,
@@ -145,12 +162,8 @@ class MaskedCubeDataset(Dataset):
         if hd.shape[3] != self.n_target:
             raise ValueError(f"{path}: {hd.shape[3]} frame target dal frame {offset}, "
                              f"ne servono {self.n_target}")
-        mask = torch.from_numpy(valid_mask(hd, self.threshold, self.prob_scale)
-                                .astype(np.float32)).unsqueeze(1)          # (n, 1, H, W)
-        if self.resize is not None and tuple(mask.shape[-2:]) != (self.resize, self.resize):
-            mask = (F.interpolate(mask, size=(self.resize, self.resize), mode="area")
-                    >= 0.999).float()
-        if item.pop("hflip", False):                # the images were flipped: so is the mask
+        mask = cloud_mask_tensor(hd, self.threshold, self.prob_scale, self.resize)
+        if item.pop("hflip", False):               # the images were flipped: so is the mask
             mask = torch.flip(mask, dims=[-1])
         item["cloud_mask"] = mask
         return item
@@ -412,10 +425,15 @@ def score_cube(pred_cubes: Sequence[np.ndarray], targs: np.ndarray,
     return best
 
 
+def cube_seed(cube: str, seed: int) -> int:
+    """Seed of the legacy numpy generator for one cube: it depends on the cube and on `seed` only."""
+    return (zlib.crc32(cube.encode("utf-8")) + int(seed)) % (2 ** 32)
+
+
 def score_batch(pred_samples: Sequence[torch.Tensor], target: torch.Tensor,
                 cloud: Optional[torch.Tensor], cube_paths: Sequence[str],
                 lo: np.ndarray, hi: np.ndarray, ssim_data_range: float = SSIM_DATA_RANGE,
-                scoring: str = "fast") -> List[Dict[str, object]]:
+                scoring: str = "fast", seed: Optional[int] = None) -> List[Dict[str, object]]:
     """
     Una riga di risultati per ogni cubo di un batch.
 
@@ -426,20 +444,41 @@ def score_batch(pred_samples: Sequence[torch.Tensor], target: torch.Tensor,
                    nessun pixel escluso
     cube_paths     percorso del .npz di ogni cubo, per il nome della riga
     lo, hi         estremi per banda della normalizzazione min-max del dataloader
+    seed           None = il rumore di regolarizzazione di OLS (generatore legacy di numpy)
+                   viene dallo stato globale; un intero = lo si riparte, per ogni cubo, da
+                   cube_seed(cubo, seed): il punteggio di un cubo non dipende piu' da quali
+                   cubi sono stati valutati prima, ne' da quale processo li valuta
     """
     rows = []
     for b in range(target.shape[0]):
+        cube = Path(str(cube_paths[b]))
+        name = f"{cube.parent.name}/{cube.name}"
+        if seed is not None:
+            np.random.seed(cube_seed(name, seed))
         targ_cube = to_cube(target[b], lo, hi)
         mask_cube = to_mask(None if cloud is None else cloud[b], targ_cube.shape)
         pred_cubes = [to_cube(q[b], lo, hi) for q in pred_samples]
 
         row = score_cube(pred_cubes, targ_cube, mask_cube, ssim_data_range, scoring)
-        cube = Path(str(cube_paths[b]))
-        row["cube"] = f"{cube.parent.name}/{cube.name}"
+        row["cube"] = name
         row["P_MAE"] = row["p_sum"] / row["p_count"] if row["p_count"] else None
         row["N_MAE"] = row["n_sum"] / row["n_count"] if row["n_count"] else None
         rows.append(row)
     return rows
+
+
+def score_batch_task(pred_samples, target, cloud, cube_paths, lo, hi, ssim_data_range,
+                     scoring, seed) -> Tuple[List[Dict[str, object]], float]:
+    """score_batch for a pool of worker processes: (rows, CPU seconds spent)."""
+    start = time.perf_counter()
+    rows = score_batch(pred_samples, target, cloud, cube_paths, lo, hi, ssim_data_range,
+                       scoring, seed)
+    return rows, time.perf_counter() - start
+
+
+def init_scoring_worker() -> None:
+    """Initializer of the scoring worker processes: one thread each, the pool is the parallelism."""
+    torch.set_num_threads(1)
 
 
 def unique_rows(rows: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:

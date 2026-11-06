@@ -53,7 +53,6 @@ import contextlib
 import copy
 import json
 import logging
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,6 +77,7 @@ from src.config import (PathsCfg, load_saved_config, project_path, use_project_d
                         validate_config)
 from src.dataset.dataloader_s2_dif import S2DiffusionCubeDataset, load_highres_stats
 from src.dataset.dataset_info import load_dataset_info, split_files
+from src.dataset.test_cubes import EarthNetTestDataset, list_test_pairs
 from src.model.autoencoder_utils import get_vae
 from src.training.run_outputs import write_json
 
@@ -103,7 +103,7 @@ class SplitSpec:
     n_target: Optional[int] = None
 
 
-# Le finestre degli split di test sono quelle dei file EarthNet2021 (merge_pair si
+# Le finestre degli split di test sono quelle dei file EarthNet2021 (read_test_cube si
 # ferma se un cubo ha un numero di frame diverso, invece di produrne uno sfasato):
 #   iid, ood   10 + 20 frame   (150 giorni di meteo)
 #   extreme    20 + 40 frame   (300 giorni)
@@ -424,112 +424,8 @@ def load_ae(cfg, ckpt_path: Path, device: torch.device):
 
 
 # ===========================================================================
-# 5. Cubi: pool, fusione contesto/target, dataset
+# 5. Cubi: pool, lettura contesto/target, dataset
 # ===========================================================================
-def list_pairs(test_dir: Path, merged_dir: Path) -> List[Tuple[Path, Path, Path]]:
-    """
-    (cubo fuso, file di contesto, file di target) per ogni cubo di uno split di
-    test EarthNet. I due file stanno in context/<tile>/ e target/<tile>/ con lo
-    stesso nome a meno del prefisso (context_<cubo>.npz, target_<cubo>.npz).
-    """
-    ctx_root, tgt_root = test_dir / "context", test_dir / "target"
-    for root in (ctx_root, tgt_root):
-        if not root.is_dir():
-            raise SystemExit(f"{root} non trovato: scarica lo split di test in {test_dir} "
-                             f"(oppure indica --test-root).")
-
-    def key(path: Path, root: Path) -> Tuple[str, str]:
-        rel = path.relative_to(root)
-        return rel.parent.as_posix(), rel.name.split("_", 1)[-1]
-
-    targets = {key(p, tgt_root): p for p in tgt_root.rglob("*.npz")}
-    pairs, missing = [], 0
-    for ctx in sorted(ctx_root.rglob("*.npz")):
-        tile, cube = key(ctx, ctx_root)
-        tgt = targets.get((tile, cube))
-        if tgt is None:
-            missing += 1
-            continue
-        pairs.append((merged_dir / tile / cube, ctx, tgt))
-    if missing:
-        log.warning(f"{missing} file di contesto senza il corrispondente target in {tgt_root}")
-    if not pairs:
-        raise SystemExit(f"nessuna coppia context/target in {test_dir}")
-    return pairs
-
-
-def _merged_is_valid(path: Path, sources: Sequence[Path], expected: np.ndarray) -> bool:
-    """Cubo fuso gia' presente, piu' recente dei sorgenti e fatto con gli stessi parametri."""
-    if not path.is_file():
-        return False
-    if path.stat().st_mtime < max(s.stat().st_mtime for s in sources):
-        return False
-    try:
-        with np.load(path) as z:
-            return bool(np.array_equal(z["merge_info"], expected))
-    except Exception:
-        return False
-
-
-def merge_pair(ctx_path: Path, tgt_path: Path, out_path: Path, n_context: int,
-               n_target: int, n_bands: int, steps_per_frame: int) -> None:
-    """
-    Un cubo di test = file di contesto + file di target -> un solo .npz nel
-    formato che il dataset del training legge (highresdynamic, highresstatic,
-    mesodynamic), con i frame di contesto prima di quelli di target.
-
-    - highresdynamic: i frame si concatenano sull'asse del tempo, tenendo le
-      prime n_bands bande (blue, green, red, nir; il resto sono maschere);
-    - mesodynamic: i giorni di contesto e quelli di target si concatenano, a meno
-      che il contesto non li copra gia' tutti;
-    - highresstatic e mesostatic: dal contesto.
-    Se qualcosa non torna (numero di frame, giorni di meteo) si ferma qui con le
-    shape in chiaro, invece di produrre un cubo sfasato.
-    """
-    expected = np.array([n_context, n_target, n_bands, steps_per_frame])
-    if _merged_is_valid(out_path, (ctx_path, tgt_path), expected):
-        return
-
-    with np.load(ctx_path) as ctx, np.load(tgt_path) as tgt:
-        hd_c, hd_t = ctx["highresdynamic"], tgt["highresdynamic"]
-        if hd_c.shape[3] != n_context or hd_t.shape[3] != n_target:
-            raise SystemExit(
-                f"{ctx_path.name}: attesi {n_context} frame di contesto e {n_target} di target, "
-                f"trovati {hd_c.shape[3]} e {hd_t.shape[3]} (shape {hd_c.shape} / {hd_t.shape})")
-        if min(hd_c.shape[2], hd_t.shape[2]) < n_bands:
-            raise SystemExit(f"{ctx_path.name}: servono {n_bands} bande, trovate "
-                             f"{hd_c.shape[2]} nel contesto e {hd_t.shape[2]} nel target")
-
-        merged = {"highresdynamic": np.concatenate([hd_c[:, :, :n_bands], hd_t[:, :, :n_bands]],
-                                                   axis=3)}
-
-        static_src = ctx if "highresstatic" in ctx.files else tgt
-        if "highresstatic" not in static_src.files:
-            raise SystemExit(f"{ctx_path.name}: highresstatic assente in contesto e target")
-        merged["highresstatic"] = static_src["highresstatic"]
-        if "mesostatic" in ctx.files:
-            merged["mesostatic"] = ctx["mesostatic"]
-
-        need = (n_context + n_target) * steps_per_frame
-        md_c = ctx["mesodynamic"]
-        md_t = tgt["mesodynamic"] if "mesodynamic" in tgt.files else None
-        if md_c.shape[3] >= need:
-            merged["mesodynamic"] = md_c
-        elif md_t is not None and md_c.shape[3] + md_t.shape[3] == need:
-            merged["mesodynamic"] = np.concatenate([md_c, md_t], axis=3)
-        else:
-            raise SystemExit(
-                f"{ctx_path.name}: servono {need} giorni di mesodynamic "
-                f"({n_context + n_target} frame x {steps_per_frame}), trovati "
-                f"{md_c.shape[3]} nel contesto e "
-                f"{'nessuno' if md_t is None else md_t.shape[3]} nel target")
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out_path.with_name(out_path.stem + ".tmp.npz")
-    np.savez(tmp, merge_info=expected, **merged)
-    os.replace(tmp, out_path)
-
-
 def select_samples(pool: Sequence[Path], num_samples: int, seed: int) -> List[Path]:
     """
     num_samples cubi estratti dal pool con un seed esplicito.
@@ -568,17 +464,23 @@ def load_condition_stats(params) -> dict:
     return stats
 
 
-def build_eval_dataset(cfg, files: Sequence[Path], n_context: int, n_target: int) -> S2DiffusionCubeDataset:
+def build_eval_dataset(cfg, files: Sequence[Path], n_context: int, n_target: int,
+                       pairs: Optional[Dict[str, Tuple[Path, Path]]] = None,
+                       cloud: Optional[Tuple[float, float]] = None) -> S2DiffusionCubeDataset:
     """
     Stesso dataset del training, con le stesse statistiche di normalizzazione, ma
     senza flip casuale, con il percorso del .npz nel batch e con le finestre
     dello split (T = contesto + target).
+
+    Con `pairs` (cubi di uno split di test EarthNet) ogni cubo e' letto dai suoi due file,
+    contesto e target, e fuso in memoria (src/dataset/test_cubes.py); con `cloud` =
+    (soglia, fondo scala) l'item porta anche la maschera nuvole dei frame target.
     """
     p = cfg.data.params
     highres_lo, highres_hi = load_highres_stats(p.stats_json, time_key=p.stats_time_key,
                                                 n_bands=p.n_channels)
     cond = load_condition_stats(p)
-    return S2DiffusionCubeDataset(
+    kwargs = dict(
         files=list(files),
         highres_lo=highres_lo,
         highres_hi=highres_hi,
@@ -599,14 +501,26 @@ def build_eval_dataset(cfg, files: Sequence[Path], n_context: int, n_target: int
         dtype=p.dtype,
         resize=p.resize,
     )
+    if pairs is not None:
+        return EarthNetTestDataset(pairs=pairs, cloud=cloud, **kwargs)
+    return S2DiffusionCubeDataset(**kwargs)
 
 
-def build_pool(spec: SplitSpec, cfg, args, n_context: int, n_target: int
-               ) -> Tuple[List[Path], str, Callable[[List[Path]], List[Path]]]:
+def check_cubes_exist(selected: Sequence[Path]) -> List[Path]:
+    """I cubi scelti di uno split di dataset.json (train, val) devono stare in data/raw."""
+    missing = [f for f in selected if not Path(f).is_file()]
+    if missing:
+        raise SystemExit(f"cubi non trovati (manca data/raw?): {missing[:3]}")
+    return list(selected)
+
+
+def build_pool(spec: SplitSpec, cfg, args
+               ) -> Tuple[List[Path], str, Optional[Dict[str, Tuple[Path, Path]]]]:
     """
-    (elenco dei cubi, descrizione, prepara) dello split. `prepara` riceve i cubi
-    scelti e restituisce i .npz da leggere: per gli split EarthNet fonde prima
-    contesto e target, e solo per i cubi scelti.
+    (elenco dei cubi, descrizione, coppie) dello split. Per gli split EarthNet i cubi
+    sono percorsi virtuali (src/dataset/test_cubes.py) e `coppie` associa a ognuno i suoi
+    due file, contesto e target, che il dataset fonde in memoria; per train e val
+    (un .npz per cubo) `coppie` e' None.
     """
     params = cfg.data.params
     if not spec.earthnet:
@@ -617,34 +531,17 @@ def build_pool(spec: SplitSpec, cfg, args, n_context: int, n_target: int
             raise SystemExit(str(err)) from err
         if not files:
             raise SystemExit(f"lo split '{spec.name}' di {params.dataset_json} e' vuoto")
-
-        def prepare(selected: List[Path]) -> List[Path]:
-            missing = [f for f in selected if not f.is_file()]
-            if missing:
-                raise SystemExit(f"cubi non trovati (manca data/raw?): {missing[:3]}")
-            return selected
-
         return (files,
                 f"split '{spec.name}' di {Path(params.dataset_json).name} ({len(files)} cubi)",
-                prepare)
+                None)
 
     test_dir = (Path(args.test_root) / f"{spec.name}_test_split" if args.test_root
                 else project_path(cfg.paths.raw_dir).parent / f"{spec.name}_test_split")
-    merged_root = (Path(args.merged_root) if args.merged_root
-                   else project_path(cfg.paths.preprocessed_dir) / "merged_test")
-    pairs = list_pairs(test_dir, merged_root / spec.name)
-    by_merged = {merged: (ctx, tgt) for merged, ctx, tgt in pairs}
-
-    def prepare(selected: List[Path]) -> List[Path]:
-        for merged in selected:
-            ctx, tgt = by_merged[merged]
-            merge_pair(ctx, tgt, merged, n_context, n_target,
-                       int(params.n_channels), int(params.meso_steps_per_frame))
-        return selected
-
-    return (sorted(by_merged),
+    pairs = list_test_pairs(test_dir)
+    by_virtual = {str(virtual): (ctx, tgt) for virtual, ctx, tgt in pairs}
+    return (sorted(virtual for virtual, _, _ in pairs),
             f"test {spec.name} ({test_dir.as_posix()}, {len(pairs)} coppie context/target)",
-            prepare)
+            by_virtual)
 
 
 # ===========================================================================
@@ -906,9 +803,6 @@ def parse_args():
     p.add_argument("--test-root", type=str, default=None,
                    help="cartella che contiene <split>_test_split/{context,target} "
                         "(default: la cartella che contiene paths.raw_dir, cioe' data/raw)")
-    p.add_argument("--merged-root", type=str, default=None,
-                   help="dove si salvano i cubi test fusi context+target "
-                        "(default: <preprocessed_dir>/merged_test)")
     p.add_argument("--cols", type=int, default=10,
                    help="frame per riga; con 20 o 40 frame si ottengono 2 o 4 blocchi")
     p.add_argument("--scale", choices=("gt", "joint", "physical"), default="gt",
@@ -982,8 +876,10 @@ def main() -> None:
                 bundle_windows = (n_context, n_target)
 
         # --- cubi -----------------------------------------------------------
-        pool, pool_desc, prepare = build_pool(spec, split_cfg, args, n_context, n_target)
-        selected = prepare(select_samples(pool, args.num_samples, args.seed))
+        pool, pool_desc, pairs = build_pool(spec, split_cfg, args)
+        selected = select_samples(pool, args.num_samples, args.seed)
+        if pairs is None:
+            check_cubes_exist(selected)
 
         print(f"\n[{spec.name}] pool: {pool_desc}")
         print(f"[{spec.name}] sequenza: {n_context + n_target} istanti = {n_context} contesto + "
@@ -996,7 +892,7 @@ def main() -> None:
         (out_root / "selected_samples.txt").write_text(
             "".join(f"{Path(f).as_posix()}\n" for f in selected), encoding="utf-8")
 
-        dataset = build_eval_dataset(split_cfg, selected, n_context, n_target)
+        dataset = build_eval_dataset(split_cfg, selected, n_context, n_target, pairs=pairs)
         loader = DataLoader(dataset, batch_size=max(1, args.batch_size), shuffle=False,
                             num_workers=0)
 
